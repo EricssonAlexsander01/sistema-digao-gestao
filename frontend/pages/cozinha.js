@@ -1,5 +1,9 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Cozinha & Comandas
+   FIX Bug #9: listeners vivem em #coz-root (recriado a cada render),
+   eliminando o listener global em document que reagia a [data-action]
+   de outras telas (ex: .qty-btn do PDV/WhatsApp) e disparava
+   PUT /orders/undefined.
    ============================================================ */
 
 let cozinhaTimer = null;
@@ -10,6 +14,7 @@ let cozinhaTimer = null;
 window.loadCozinha = async function (container) {
   console.log('[cozinha] loadCozinha iniciado');
   container.innerHTML = renderCozinhaLayout();
+  bindCozinhaEvents();
   await carregarCozinha();
 
   // Auto-refresh a cada 10s
@@ -27,10 +32,11 @@ window.addEventListener('hashchange', () => {
 
 // ============================================================
 // LAYOUT
+// FIX Bug #9 — todo o HTML é envolvido em #coz-root.
 // ============================================================
 function renderCozinhaLayout() {
   return `
-    <div class="page-padding" style="display:flex;flex-direction:column;gap:16px;overflow-y:auto">
+    <div id="coz-root" class="page-padding" style="display:flex;flex-direction:column;gap:16px;overflow-y:auto">
 
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
         <div>
@@ -57,6 +63,50 @@ function renderCozinhaLayout() {
       <div id="cozinha-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;align-content:start;padding-bottom:24px"></div>
     </div>
   `;
+}
+
+// ============================================================
+// EVENTOS
+// FIX Bug #9 — listeners registrados em #coz-root (recriado a
+// cada render), não em document. Ao sair da cozinha, o root é
+// destruído e os listeners morrem junto.
+// ============================================================
+function bindCozinhaEvents() {
+  const root = document.getElementById('coz-root');
+  if (!root) return;
+
+  // ===== Botão de refresh =====
+  const refreshBtn = root.querySelector('#coz-refresh');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => {
+      carregarCozinha();
+    });
+  }
+
+  // ===== Botões de ação nas comandas (delegado em #coz-root) =====
+  // Restrito a elementos que tenham data-action="start" ou "ready"
+  // E data-id (que só existem dentro dos cards da cozinha).
+  root.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+
+    // Defesa: só processa ações próprias da cozinha
+    const action = btn.dataset.action;
+    if (action !== 'start' && action !== 'ready') return;
+
+    const id = btn.dataset.id;
+    if (!id) return;
+
+    const status = action === 'start' ? 'EM PREPARO' : 'PRONTO';
+
+    try {
+      await Digao.put(`/orders/${id}`, { status });
+      Digao.toast(`Pedido atualizado para ${status}`, 'success');
+      carregarCozinha();
+    } catch (err) {
+      console.error('[cozinha] erro ao atualizar:', err);
+    }
+  });
 }
 
 // ============================================================
@@ -146,33 +196,6 @@ function renderComanda(p) {
     </div>
   `;
 }
-
-// ============================================================
-// EVENTOS DE CLIQUE
-// ============================================================
-document.addEventListener('click', async (e) => {
-  // Botão de refresh
-  if (e.target.closest('#coz-refresh')) {
-    carregarCozinha();
-    return;
-  }
-
-  // Botão de ação nas comandas
-  const btn = e.target.closest('[data-action]');
-  if (!btn) return;
-
-  const action = btn.dataset.action;
-  const id = btn.dataset.id;
-  const status = action === 'start' ? 'EM PREPARO' : 'PRONTO';
-
-  try {
-    await Digao.put(`/orders/${id}`, { status });
-    Digao.toast(`Pedido atualizado para ${status}`, 'success');
-    carregarCozinha();
-  } catch (e) {
-    console.error('[cozinha] erro ao atualizar:', e);
-  }
-});
 
 // ============================================================
 // HELPERS

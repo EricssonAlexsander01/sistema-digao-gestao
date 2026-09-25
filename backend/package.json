@@ -18,6 +18,7 @@
   "author": "Projeto Digão Gestão",
   "license": "MIT",
   "dependencies": {
+    "@tbalegas/node-printer": "^1.0.2",
     "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
     "dotenv": "^18.0.3",

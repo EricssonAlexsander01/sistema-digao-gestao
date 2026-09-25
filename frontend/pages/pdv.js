@@ -1,5 +1,8 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo PDV (com suporte a MESA)
+   FIX Bug #1: 1 mesa = 1 pedido ativo.
+   FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render),
+   eliminando listener zumbi que reagia a cliques de outras telas.
    ============================================================ */
 
 let produtosCache = [];
@@ -43,6 +46,15 @@ window.loadPDV = async function (container, params = {}) {
 
   renderProdutos();
   renderCarrinho();
+
+  // FIX Bug #6 — abre o modal de pagamento automaticamente quando
+  // a URL traz ?pay=ID e o ID corresponde ao pedido ativo da mesa.
+  // Ignora silenciosamente se qualquer condição falhar.
+  if (params.pay && mesaCtx && mesaCtx.open_order) {
+    if (Number(params.pay) === mesaCtx.open_order.id) {
+      abrirModalPagamentoMesa(mesaCtx.open_order);
+    }
+  }
 };
 
 // ============================================================
@@ -85,6 +97,7 @@ function carregarItensDoPedidoAberto(order) {
 
 // ============================================================
 // RENDER — estrutura da tela
+// FIX Bug #8 — todo o HTML é envolvido em #pdv-root.
 // ============================================================
 function renderPDV() {
   const bannerMesa = mesaCtx ? `
@@ -115,7 +128,7 @@ function renderPDV() {
   ` : '';
 
   return `
-    <div style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0">
+    <div id="pdv-root" style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0">
       ${bannerMesa}
       <div class="pdv-container">
 
@@ -218,6 +231,7 @@ function renderPDV() {
 // ============================================================
 function renderProdutos() {
   const grid = document.getElementById('product-grid');
+  if (!grid) return;
   const busca = filtroBusca.toLowerCase().trim();
 
   const filtrados = produtosCache.filter(p => {
@@ -269,6 +283,7 @@ function iconForCategory(cat, isAdditional) {
 // ============================================================
 function renderCarrinho() {
   const itemsEl = document.getElementById('cart-items');
+  if (!itemsEl) return;   // FIX Bug #8 — segurança: não quebra se tela foi trocada
   const cart = Digao.state.cart;
 
   if (cart.length === 0) {
@@ -300,27 +315,33 @@ function renderCarrinho() {
   const taxa = (!mesaCtx && Digao.state.channel === 'WHATSAPP') ? Digao.state.deliveryFee : 0;
   const total = subtotal + taxa;
 
-  document.getElementById('subtotal').textContent = Digao.money(subtotal);
-  document.getElementById('taxa-entrega').textContent = Digao.money(taxa);
-  document.getElementById('total').textContent = Digao.money(total);
+  const subtotalEl = document.getElementById('subtotal');
+  const taxaEl = document.getElementById('taxa-entrega');
+  const totalEl = document.getElementById('total');
+
+  if (subtotalEl) subtotalEl.textContent = Digao.money(subtotal);
+  if (taxaEl) taxaEl.textContent = Digao.money(taxa);
+  if (totalEl) totalEl.textContent = Digao.money(total);
 
   const trocoRow = document.getElementById('troco-row');
   if (trocoRow) {
     if (Digao.state.paymentMethod === 'DINHEIRO') {
       trocoRow.classList.remove('hidden');
       const recebidoInput = document.getElementById('valor-recebido');
-      const recebido = Number(recebidoInput.value) || 0;
+      const recebido = Number(recebidoInput?.value) || 0;
       const troco = recebido - total;
       const trocoEl = document.getElementById('troco');
-      trocoEl.textContent = Digao.money(Math.max(troco, 0));
-      trocoEl.style.color = troco >= 0 ? 'var(--success)' : 'var(--danger)';
+      if (trocoEl) {
+        trocoEl.textContent = Digao.money(Math.max(troco, 0));
+        trocoEl.style.color = troco >= 0 ? 'var(--success)' : 'var(--danger)';
+      }
     } else {
       trocoRow.classList.add('hidden');
     }
   }
 
   const btn = document.getElementById('confirm-btn');
-  btn.disabled = cart.length === 0;
+  if (btn) btn.disabled = cart.length === 0;
 }
 
 // ============================================================
@@ -360,34 +381,33 @@ function alterarQtd(index, delta) {
 
 // ============================================================
 // EVENTOS
+// FIX Bug #8 — todos os listeners vivem em #pdv-root (ou filhos),
+// que é recriado a cada render. Nenhum listener em #app-view.
 // ============================================================
 function bindPDVEvents() {
-  const container = document.getElementById('app-view');
-
-  // 🔧 Remove listeners antigos clonando o container
-  const oldContainer = container;
-  const newContainer = container.cloneNode(true);
-  oldContainer.parentNode.replaceChild(newContainer, container);
+  // FIX Bug #8 — root local, recriado a cada render.
+  const root = document.getElementById('pdv-root');
+  if (!root) return;
 
   // ===== Botões do modo mesa =====
-  document.getElementById('btn-voltar-mesas')?.addEventListener('click', () => {
+  root.querySelector('#btn-voltar-mesas')?.addEventListener('click', () => {
     location.hash = 'mesas';
   });
 
-  document.getElementById('btn-fechar-conta')?.addEventListener('click', () => {
+  root.querySelector('#btn-fechar-conta')?.addEventListener('click', () => {
     if (mesaCtx && mesaCtx.open_order) {
       abrirModalPagamentoMesa(mesaCtx.open_order);
     }
   });
 
-  // ===== Adicionar produto =====
-  newContainer.addEventListener('click', (e) => {
+  // ===== Adicionar produto (delegado em #pdv-root) =====
+  root.addEventListener('click', (e) => {
     const card = e.target.closest('.product-card');
     if (card) adicionarItem(card.dataset.id);
   });
 
   // ===== Busca =====
-  const searchInput = document.getElementById('search-input');
+  const searchInput = root.querySelector('#search-input');
   if (searchInput) {
     searchInput.addEventListener('input', (e) => {
       filtroBusca = e.target.value;
@@ -396,12 +416,12 @@ function bindPDVEvents() {
   }
 
   // ===== Categorias =====
-  const categories = document.getElementById('categories');
+  const categories = root.querySelector('#categories');
   if (categories) {
     categories.addEventListener('click', (e) => {
       const btn = e.target.closest('.cat-btn');
       if (!btn) return;
-      document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+      root.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       filtroCategoria = btn.dataset.cat;
       renderProdutos();
@@ -409,21 +429,21 @@ function bindPDVEvents() {
   }
 
   // ===== Canal (só sem mesa) =====
-  const channelToggle = document.getElementById('channel-toggle');
+  const channelToggle = root.querySelector('#channel-toggle');
   if (channelToggle) {
     channelToggle.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
-      document.querySelectorAll('#channel-toggle button').forEach(b => b.classList.remove('active'));
+      channelToggle.querySelectorAll('button').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       Digao.state.channel = btn.dataset.channel;
 
-      const delivery = document.getElementById('delivery-data');
+      const delivery = root.querySelector('#delivery-data');
       if (Digao.state.channel === 'WHATSAPP') {
-        delivery.classList.add('show');
+        delivery?.classList.add('show');
         if (!Digao.state.deliveryFee) Digao.state.deliveryFee = 8;
       } else {
-        delivery.classList.remove('show');
+        delivery?.classList.remove('show');
         Digao.state.deliveryFee = 0;
       }
       renderCarrinho();
@@ -431,7 +451,7 @@ function bindPDVEvents() {
   }
 
   // ===== Taxa de entrega =====
-  const deliveryFee = document.getElementById('delivery-fee');
+  const deliveryFee = root.querySelector('#delivery-fee');
   if (deliveryFee) {
     deliveryFee.addEventListener('input', (e) => {
       Digao.state.deliveryFee = Number(e.target.value) || 0;
@@ -440,12 +460,12 @@ function bindPDVEvents() {
   }
 
   // ===== Forma de pagamento =====
-  const paymentMethods = document.getElementById('payment-methods');
+  const paymentMethods = root.querySelector('#payment-methods');
   if (paymentMethods) {
     paymentMethods.addEventListener('click', (e) => {
       const btn = e.target.closest('.pay-btn');
       if (!btn) return;
-      document.querySelectorAll('.pay-btn').forEach(b => b.classList.remove('active'));
+      paymentMethods.querySelectorAll('.pay-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       Digao.state.paymentMethod = btn.dataset.method;
       renderCarrinho();
@@ -453,11 +473,11 @@ function bindPDVEvents() {
   }
 
   // ===== Valor recebido =====
-  const valorRecebido = document.getElementById('valor-recebido');
+  const valorRecebido = root.querySelector('#valor-recebido');
   if (valorRecebido) valorRecebido.addEventListener('input', renderCarrinho);
 
   // ===== Carrinho +/− =====
-  const cartItems = document.getElementById('cart-items');
+  const cartItems = root.querySelector('#cart-items');
   if (cartItems) {
     cartItems.addEventListener('click', (e) => {
       const btn = e.target.closest('.qty-btn');
@@ -468,7 +488,7 @@ function bindPDVEvents() {
   }
 
   // ===== Confirmar venda =====
-  const confirmBtn = document.getElementById('confirm-btn');
+  const confirmBtn = root.querySelector('#confirm-btn');
   if (confirmBtn) confirmBtn.addEventListener('click', confirmarVenda);
 }
 
@@ -480,6 +500,7 @@ async function confirmarVenda() {
   if (cart.length === 0) return;
 
   const btn = document.getElementById('confirm-btn');
+  if (!btn) return;
   btn.disabled = true;
   btn.querySelector('span').textContent = 'Processando…';
 
@@ -497,13 +518,11 @@ async function confirmarVenda() {
       delivery_fee: (!mesaCtx && Digao.state.channel === 'WHATSAPP') ? Digao.state.deliveryFee : 0
     };
 
-    // Contexto de mesa
     if (mesaCtx) {
       payload.table_id = mesaCtx.table_id;
       payload.waiter_id = mesaCtx.waiter_id;
     }
 
-    // Contexto de WhatsApp
     if (!mesaCtx && Digao.state.channel === 'WHATSAPP') {
       payload.customer_name = document.getElementById('cust-name').value.trim() || null;
       payload.customer_phone = document.getElementById('cust-phone').value.trim() || null;
@@ -514,28 +533,28 @@ async function confirmarVenda() {
 
     const order = await Digao.post('/orders', payload);
 
-    // ===== FLUXO MESA: só acumula, não paga =====
+    // ===== FLUXO MESA =====
     if (mesaCtx) {
-      Digao.toast(
-        `${mesaCtx.table_name}: +${cart.length} ${cart.length === 1 ? 'item' : 'itens'} adicionado(s)`,
-        'success',
-        2500
-      );
+      const msg = order.jaExistia
+        ? `${mesaCtx.table_name}: +${order.itensAdicionados} ${order.itensAdicionados === 1 ? 'item' : 'itens'} na comanda #${Digao.pad(order.number)}`
+        : `${mesaCtx.table_name}: comanda #${Digao.pad(order.number)} aberta`;
+      Digao.toast(msg, 'success', 2500);
 
-      // Recarrega o contexto (com o pedido consolidado)
       await carregarContextoMesa(mesaCtx.table_id);
 
-      // Limpa carrinho e recarrega itens atualizados
       Digao.state.cart = [];
       if (mesaCtx.open_order) {
         carregarItensDoPedidoAberto(mesaCtx.open_order);
       }
       renderCarrinho();
 
+      const obsField = document.getElementById('order-observation');
+      if (obsField) obsField.value = '';
+
       return;
     }
 
-    // ===== FLUXO BALCÃO / WHATSAPP: paga na hora =====
+    // ===== FLUXO BALCÃO / WHATSAPP =====
     const recebido = Digao.state.paymentMethod === 'DINHEIRO'
       ? Number(document.getElementById('valor-recebido').value) || order.total
       : null;
@@ -560,10 +579,12 @@ async function confirmarVenda() {
   } catch (e) {
     console.error(e);
   } finally {
-    btn.disabled = false;
-    btn.querySelector('span').textContent = mesaCtx
-      ? 'Adicionar à comanda'
-      : 'Confirmar & Gerar Comanda';
+    if (btn) {
+      btn.disabled = false;
+      btn.querySelector('span').textContent = mesaCtx
+        ? 'Adicionar à comanda'
+        : 'Confirmar & Gerar Comanda';
+    }
   }
 }
 
@@ -653,7 +674,6 @@ function abrirModalPagamentoMesa(order) {
         received: recebido
       });
 
-      const comanda = await Digao.get(`/orders/${order.id}/comanda`);
       m.close();
 
       Digao.toast(`${mesaCtx.table_name} paga com sucesso!`, 'success', 3000);

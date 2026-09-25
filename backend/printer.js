@@ -1,6 +1,9 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo de Impressão
    Bematech MP-4200 TH (USB via compartilhamento do Windows)
+   FIX Bug #7: substituído require('printer') por
+   require('@tbalegas/node-printer') — fork mantido, com
+   prebuild para Windows x64 + Node 22, validado em teste isolado.
    ============================================================ */
 
 require('dotenv').config();
@@ -39,7 +42,8 @@ async function enviarParaImpressora(printer) {
   }
 
   // Modo real: usa a interface do compartilhamento
-  printer.setPrinterDriver(require('printer'));
+  // FIX Bug #7 — driver substituído pelo fork mantido
+  printer.setPrinterDriver(require('@tbalegas/node-printer'));
   printer.setInterface(`//localhost/${PRINTER_NAME}`);
   await printer.execute();
   return { ok: true };
@@ -185,7 +189,7 @@ async function imprimirTeste() {
 // ============================================================
 function formatarData(iso) {
   if (!iso) return '--';
-  const d = new Date(iso.replace(' ', 'T'));
+  const d = new Date(iso.replace(' ', 'T') + 'Z');
   return d.toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
 }
 

@@ -1,6 +1,10 @@
 // server.js — API REST do Digão Gestão (Seção 23 do documento)
 // + Módulo de Mesas e Garçons
 // + Módulo de Impressão (Bematech MP-4200 TH)
+// + FIX Bug #1: 1 mesa = 1 pedido ativo (adiciona itens ao pedido existente)
+// + Separação de estado OPERACIONAL vs FINANCEIRO
+// + FIX Bug #2: impressão automática para TODOS os canais
+// + FIX Bug #4: timezone local em todas as queries de data (16 ocorrências)
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -13,20 +17,51 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Serve o frontend automaticamente
 app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
-// Log simples de requisições
 app.use((req, res, next) => {
   console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${req.method} ${req.url}`);
   next();
 });
 
-// Helper: garante que existe caixa aberto
+// ============================================================
+// HELPERS DE ESTADO
+// ============================================================
+
 function getOpenCashRegister() {
   return db.prepare(
     "SELECT * FROM cash_registers WHERE status='ABERTO' ORDER BY id DESC LIMIT 1"
   ).get();
+}
+
+function getActiveOrderByTable(tableId) {
+  return db.prepare(`
+    SELECT * FROM orders
+    WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
+    ORDER BY id ASC LIMIT 1
+  `).get(tableId);
+}
+
+function getFinancialStatus(orderId) {
+  const p = db.prepare('SELECT 1 FROM payments WHERE order_id = ? LIMIT 1').get(orderId);
+  return p ? 'PAGO' : 'ABERTO';
+}
+
+function enrichOrder(order) {
+  if (!order) return order;
+  return { ...order, financial_status: getFinancialStatus(order.id) };
+}
+
+function recalcularTotaisPedido(orderId) {
+  const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId);
+  const subtotal = items.reduce((s, i) => s + (i.price * i.quantity), 0);
+  const order = db.prepare('SELECT delivery_fee FROM orders WHERE id = ?').get(orderId);
+  const fee = order?.delivery_fee || 0;
+  const total = subtotal + fee;
+  db.prepare(`
+    UPDATE orders SET subtotal = ?, total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+  `).run(subtotal, total, orderId);
+  return { subtotal, delivery_fee: fee, total };
 }
 
 // ============================================================
@@ -35,14 +70,14 @@ function getOpenCashRegister() {
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.2.0',
+    versao: '1.6.0',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
     modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão']
   });
 });
 
 // ============================================================
-// CATEGORIES (Seção 6)
+// CATEGORIES
 // ============================================================
 app.get('/api/categories', (req, res) => {
   res.json(db.prepare('SELECT * FROM categories WHERE active = 1').all());
@@ -60,7 +95,7 @@ app.post('/api/categories', (req, res) => {
 });
 
 // ============================================================
-// PRODUCTS (Seção 6)
+// PRODUCTS
 // ============================================================
 app.get('/api/products', (req, res) => {
   const { category, active } = req.query;
@@ -77,7 +112,6 @@ app.get('/api/products', (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-// Busca por código de barras (Fase 3 — leitor)
 app.get('/api/products/barcode/:code', (req, res) => {
   const p = db.prepare(`
     SELECT p.*, c.name AS category
@@ -122,7 +156,7 @@ app.delete('/api/products/:id', (req, res) => {
 });
 
 // ============================================================
-// WAITERS — Garçons
+// WAITERS
 // ============================================================
 app.get('/api/waiters', (req, res) => {
   res.json(db.prepare('SELECT * FROM waiters WHERE active = 1 ORDER BY name').all());
@@ -157,7 +191,7 @@ app.put('/api/waiters/:id', (req, res) => {
 });
 
 // ============================================================
-// TABLES — Mesas
+// TABLES
 // ============================================================
 app.get('/api/tables', (req, res) => {
   const tables = db.prepare(`
@@ -168,13 +202,10 @@ app.get('/api/tables', (req, res) => {
   `).all();
 
   tables.forEach(t => {
-    const order = db.prepare(`
-      SELECT * FROM orders
-      WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
-      ORDER BY id DESC LIMIT 1
-    `).get(t.id);
+    const order = getActiveOrderByTable(t.id);
     if (order) {
       order.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+      order.financial_status = getFinancialStatus(order.id);
       t.open_order = order;
     } else {
       t.open_order = null;
@@ -243,7 +274,7 @@ app.post('/api/tables/:id/force-free', (req, res) => {
 });
 
 // ============================================================
-// ORDERS + MESA
+// ORDERS
 // ============================================================
 app.get('/api/orders', (req, res) => {
   const { status, channel, limit, date, table_id } = req.query;
@@ -252,7 +283,8 @@ app.get('/api/orders', (req, res) => {
   if (status) { sql += ' AND status = ?'; params.push(status); }
   if (channel) { sql += ' AND channel = ?'; params.push(channel); }
   if (table_id) { sql += ' AND table_id = ?'; params.push(table_id); }
-  if (date) { sql += ' AND date(created_at) = date(?)'; params.push(date); }
+  // FIX Bug #4 (item #1): 'localtime' para respeitar fuso do usuário
+  if (date) { sql += " AND date(created_at, 'localtime') = date(?)"; params.push(date); }
   sql += ' ORDER BY id DESC';
   if (limit) { sql += ' LIMIT ?'; params.push(Number(limit)); }
 
@@ -260,6 +292,7 @@ app.get('/api/orders', (req, res) => {
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
     o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
+    o.financial_status = o.payment ? 'PAGO' : 'ABERTO';
     if (o.table_id) {
       o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
     }
@@ -275,6 +308,7 @@ app.get('/api/orders/:id', (req, res) => {
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
   o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
   o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
+  o.financial_status = o.payment ? 'PAGO' : 'ABERTO';
   if (o.table_id) {
     o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
   }
@@ -315,6 +349,50 @@ app.post('/api/orders', (req, res) => {
         WHERE id = ?
       `).run(waiter_id || null, mesa.id);
     }
+
+    const pedidoExistente = getActiveOrderByTable(table_id);
+
+    if (pedidoExistente) {
+      const insertItem = db.prepare(`
+        INSERT INTO order_items (order_id, product_id, name, price, quantity, observation)
+        VALUES (?,?,?,?,?,?)
+      `);
+
+      const adicionar = db.transaction(() => {
+        items.forEach(it => {
+          insertItem.run(
+            pedidoExistente.id,
+            it.product_id || null,
+            it.name,
+            it.price,
+            it.quantity,
+            it.observation || null
+          );
+        });
+
+        if (observation) {
+          const obsAtual = pedidoExistente.observation || '';
+          const novaObs = obsAtual
+            ? `${obsAtual} | ${observation}`
+            : observation;
+          db.prepare('UPDATE orders SET observation = ? WHERE id = ?')
+            .run(novaObs, pedidoExistente.id);
+        }
+      });
+
+      adicionar();
+
+      const totais = recalcularTotaisPedido(pedidoExistente.id);
+
+      return res.json({
+        id: pedidoExistente.id,
+        number: pedidoExistente.number,
+        ...totais,
+        itensAdicionados: items.length,
+        jaExistia: true,
+        financial_status: getFinancialStatus(pedidoExistente.id)
+      });
+    }
   }
 
   const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0);
@@ -346,7 +424,15 @@ app.post('/api/orders', (req, res) => {
     insertItem.run(orderId, it.product_id || null, it.name, it.price, it.quantity, it.observation || null);
   });
 
-  res.json({ id: orderId, number: nextNum, subtotal, delivery_fee: fee, total });
+  res.json({
+    id: orderId,
+    number: nextNum,
+    subtotal,
+    delivery_fee: fee,
+    total,
+    jaExistia: false,
+    financial_status: 'ABERTO'
+  });
 });
 
 app.put('/api/orders/:id', (req, res) => {
@@ -394,7 +480,6 @@ app.post('/api/orders/:id/payment', (req, res) => {
 
   db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('EM PREPARO', order.id);
 
-  // RN012 — Mesa só libera quando TODOS os pedidos dela estiverem PAGOS
   if (order.table_id) {
     const outrosSemPagamento = db.prepare(`
       SELECT COUNT(*) AS n
@@ -414,17 +499,18 @@ app.post('/api/orders/:id/payment', (req, res) => {
         WHERE id = ?
       `).run(order.table_id);
     }
-
-    // Impressão automática da comanda (não bloqueia resposta)
-    const mesaPgto = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
-    const garcomPgto = order.waiter_id
-      ? db.prepare('SELECT * FROM waiters WHERE id = ?').get(order.waiter_id)
-      : null;
-    const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
-
-    printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
-      .catch(e => console.error('[payment] erro ao imprimir:', e));
   }
+
+  const mesaPgto = order.table_id
+    ? db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id)
+    : null;
+  const garcomPgto = order.waiter_id
+    ? db.prepare('SELECT * FROM waiters WHERE id = ?').get(order.waiter_id)
+    : null;
+  const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+
+  printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
+    .catch(e => console.error('[payment] erro ao imprimir:', e));
 
   const register = getOpenCashRegister();
   if (register) {
@@ -441,7 +527,21 @@ app.post('/api/orders/:id/payment', (req, res) => {
     }
   }
 
-  res.json({ ok: true, change, method });
+  res.json({ ok: true, change, method, financial_status: 'PAGO' });
+});
+
+// ============================================================
+// ESTADO FINANCEIRO
+// ============================================================
+app.get('/api/orders/:id/financial', (req, res) => {
+  const o = db.prepare('SELECT id FROM orders WHERE id = ?').get(req.params.id);
+  if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
+  const payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(req.params.id);
+  res.json({
+    order_id: Number(req.params.id),
+    financial_status: payment ? 'PAGO' : 'ABERTO',
+    payment: payment || null
+  });
 });
 
 // ============================================================
@@ -498,6 +598,7 @@ app.get('/api/kitchen', (req, res) => {
   `).all();
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
+    o.financial_status = getFinancialStatus(o.id);
     if (o.table_id) {
       o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
     }
@@ -606,9 +707,17 @@ app.get('/api/cash/movements', (req, res) => {
 
 // ============================================================
 // EXPENSES / LOSSES
+// FIX Bug #4 — filtros com 'localtime'
 // ============================================================
 app.get('/api/expenses', (req, res) => {
-  res.json(db.prepare('SELECT * FROM expenses ORDER BY id DESC').all());
+  const { from, to } = req.query;
+  let sql = 'SELECT * FROM expenses WHERE 1=1';
+  const params = [];
+  // FIX Bug #4 (itens #6 e #7)
+  if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
+  if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
+  sql += ' ORDER BY id DESC';
+  res.json(db.prepare(sql).all(...params));
 });
 
 app.post('/api/expenses', (req, res) => {
@@ -622,7 +731,14 @@ app.post('/api/expenses', (req, res) => {
 });
 
 app.get('/api/losses', (req, res) => {
-  res.json(db.prepare('SELECT * FROM losses ORDER BY id DESC').all());
+  const { from, to } = req.query;
+  let sql = 'SELECT * FROM losses WHERE 1=1';
+  const params = [];
+  // FIX Bug #4 (itens #8 e #9)
+  if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
+  if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
+  sql += ' ORDER BY id DESC';
+  res.json(db.prepare(sql).all(...params));
 });
 
 app.post('/api/losses', (req, res) => {
@@ -745,12 +861,17 @@ app.post('/api/drivers/:id/pay', (req, res) => {
 
 // ============================================================
 // DASHBOARD
+// FIX Bug #4 — todas as queries com 'localtime'
 // ============================================================
 app.get('/api/dashboard', (req, res) => {
-  const today = new Date().toISOString().substring(0, 10);
+  // FIX Bug #4a — calcular 'today' em horário LOCAL (não UTC)
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
+  // FIX Bug #4 (item #2)
   const orders = db.prepare(`
-    SELECT * FROM orders WHERE date(created_at) = date(?) AND status != 'CANCELADO'
+    SELECT * FROM orders
+    WHERE date(created_at, 'localtime') = date(?) AND status != 'CANCELADO'
   `).all(today);
 
   const faturamento = orders.reduce((s, o) => s + o.total, 0);
@@ -759,19 +880,22 @@ app.get('/api/dashboard', (req, res) => {
   const byChannel = (ch) =>
     orders.filter(o => o.channel === ch).reduce((s, o) => s + o.total, 0);
 
+  // FIX Bug #4 (item #3)
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
-    WHERE date(created_at) = date(?)
+    WHERE date(created_at, 'localtime') = date(?)
   `).get(today).t;
 
+  // FIX Bug #4 (item #4)
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
-    WHERE date(created_at) = date(?)
+    WHERE date(created_at, 'localtime') = date(?)
   `).get(today).t;
 
+  // FIX Bug #4 (item #5)
   const entregas = db.prepare(`
     SELECT COUNT(*) AS count, COALESCE(SUM(fee),0) AS total
-    FROM deliveries WHERE date(created_at) = date(?)
+    FROM deliveries WHERE date(created_at, 'localtime') = date(?)
   `).get(today);
 
   res.json({
@@ -793,53 +917,63 @@ app.get('/api/dashboard', (req, res) => {
 
 // ============================================================
 // RELATÓRIOS
+// FIX Bug #4 — todas as queries com 'localtime'
 // ============================================================
 app.get('/api/reports', (req, res) => {
   const { from, to } = req.query;
   const fromDate = from || '2000-01-01';
   const toDate = to || '2100-01-01';
 
+  // FIX Bug #4 (item #10)
   const orders = db.prepare(`
     SELECT * FROM orders
-    WHERE date(created_at) BETWEEN date(?) AND date(?) AND status != 'CANCELADO'
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
+      AND status != 'CANCELADO'
   `).all(fromDate, toDate);
 
   const faturamento = orders.reduce((s, o) => s + o.total, 0);
   const ticket = orders.length ? faturamento / orders.length : 0;
 
+  // FIX Bug #4 (item #11)
   const byChannel = db.prepare(`
     SELECT channel, COUNT(*) AS count, COALESCE(SUM(total),0) AS total
     FROM orders
-    WHERE date(created_at) BETWEEN date(?) AND date(?) AND status != 'CANCELADO'
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
+      AND status != 'CANCELADO'
     GROUP BY channel
   `).all(fromDate, toDate);
 
+  // FIX Bug #4 (item #12)
   const byPayment = db.prepare(`
     SELECT p.method, COUNT(*) AS count, COALESCE(SUM(p.amount),0) AS total
     FROM payments p
     JOIN orders o ON o.id = p.order_id
-    WHERE date(o.created_at) BETWEEN date(?) AND date(?)
+    WHERE date(o.created_at, 'localtime') BETWEEN date(?) AND date(?)
     GROUP BY p.method
   `).all(fromDate, toDate);
 
+  // FIX Bug #4 (item #13)
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
-    WHERE date(created_at) BETWEEN date(?) AND date(?)
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
+  // FIX Bug #4 (item #14)
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
-    WHERE date(created_at) BETWEEN date(?) AND date(?)
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
+  // FIX Bug #4 (item #15)
   const deliveries = db.prepare(`
     SELECT COUNT(*) AS count, COALESCE(SUM(fee),0) AS total
-    FROM deliveries WHERE date(created_at) BETWEEN date(?) AND date(?)
+    FROM deliveries WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate);
 
+  // FIX Bug #4 (item #16) — paid_at também
   const driverPayments = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM driver_payments
-    WHERE date(paid_at) BETWEEN date(?) AND date(?)
+    WHERE date(paid_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
   res.json({
@@ -891,7 +1025,6 @@ app.listen(PORT, '0.0.0.0', () => {
   const nets = os.networkInterfaces();
   const ips = [];
 
-  // Coleta TODOS os IPv4 de rede (ignora localhost)
   for (const name of Object.keys(nets)) {
     for (const net of nets[name]) {
       if (net.family === 'IPv4' && !net.internal) {
@@ -902,7 +1035,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.2');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');
@@ -918,6 +1051,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log(`   📂 Banco:       backend/data/digao.db`);
+  console.log(`   🕐 Timezone:    LOCAL (created_at interpretado no fuso do servidor)`);
   console.log(`   🖨️  Impressão:   ${process.env.PRINTER_SIMULATED === 'true' ? 'SIMULADA' : 'REAL'} (${process.env.PRINTER_NAME || 'mp4200'})`);
   console.log('================================================');
   console.log('');

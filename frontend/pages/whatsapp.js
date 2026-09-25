@@ -1,6 +1,9 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo WhatsApp
    Pedidos recebidos via WhatsApp — Retirada ou Entrega
+   FIX Bug #3: listener de clique agora vive em #ws-root (recriado
+   a cada render), eliminando o acúmulo que causava adição múltipla
+   de itens ao navegar repetidamente pelo módulo.
    ============================================================ */
 
 let wsProdutos = [];
@@ -8,6 +11,7 @@ let wsCategorias = [];
 let wsCarrinho = [];
 let wsTipo = 'ENTREGA'; // ou 'RETIRADA'
 let wsFormaPgto = 'PIX';
+let wsFiltroCat = 'Todos';
 
 // ============================================================
 // LOADER
@@ -21,6 +25,7 @@ window.loadWhatsApp = async function (container) {
   wsCarrinho = [];
   wsTipo = 'ENTREGA';
   wsFormaPgto = 'PIX';
+  wsFiltroCat = 'Todos';
 
   container.innerHTML = renderWhatsAppLayout();
   bindWhatsAppEvents();
@@ -30,10 +35,13 @@ window.loadWhatsApp = async function (container) {
 
 // ============================================================
 // LAYOUT
+// FIX Bug #3 — todo o HTML é envolvido em #ws-root.
+// O listener de clique é registrado nesse elemento, que é
+// destruído e recriado a cada render.
 // ============================================================
 function renderWhatsAppLayout() {
   return `
-    <div class="pdv-container">
+    <div id="ws-root" class="pdv-container">
 
       <section class="products-section">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
@@ -114,8 +122,6 @@ function renderWhatsAppLayout() {
 // ============================================================
 // PRODUTOS
 // ============================================================
-let wsFiltroCat = 'Todos';
-
 function renderWsProdutos() {
   const grid = document.getElementById('ws-product-grid');
   const filtrados = wsProdutos.filter(p => {
@@ -177,18 +183,27 @@ function renderWsCarrinho() {
 
 // ============================================================
 // EVENTOS
+// FIX Bug #3 — todos os listeners são registrados em elementos
+// que vivem dentro de #ws-root (recriado a cada render), exceto
+// o listener de clique que agora usa #ws-root como delegate.
+// Nada mais é registrado em #app-view.
 // ============================================================
 function bindWhatsAppEvents() {
-  const container = document.getElementById('app-view');
+  // FIX Bug #3 — o delegado de cliques vive em #ws-root.
+  // Este elemento é destruído a cada navegação, então o listener
+  // nunca acumula. Era o bug: antes o delegate vivia em #app-view,
+  // que é persistente entre navegações.
+  const root = document.getElementById('ws-root');
 
   // Botão "Preencher dados"
   document.getElementById('ws-btn-dados')?.addEventListener('click', abrirModalDadosCliente);
 
-  // Adicionar produto
-  container.addEventListener('click', (e) => {
+  // Adicionar produto (delegado em #ws-root)
+  root.addEventListener('click', (e) => {
     const card = e.target.closest('.product-card');
     if (card) {
       const prod = wsProdutos.find(p => p.id === Number(card.dataset.id));
+      if (!prod) return;
       const ex = wsCarrinho.find(i => i.product_id === prod.id);
       if (ex) ex.quantity++;
       else wsCarrinho.push({ product_id: prod.id, name: prod.name, price: prod.price, quantity: 1 });
@@ -197,19 +212,19 @@ function bindWhatsAppEvents() {
   });
 
   // Categorias
-  document.querySelector('.categories').addEventListener('click', (e) => {
+  root.querySelector('.categories').addEventListener('click', (e) => {
     const btn = e.target.closest('.cat-btn');
     if (!btn) return;
-    document.querySelectorAll('.categories .cat-btn').forEach(b => b.classList.remove('active'));
+    root.querySelectorAll('.categories .cat-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     wsFiltroCat = btn.dataset.cat;
     renderWsProdutos();
   });
 
   // Tipo (Entrega / Retirada)
-  document.querySelectorAll('[data-tipo]').forEach(btn => {
+  root.querySelectorAll('[data-tipo]').forEach(btn => {
     btn.addEventListener('click', () => {
-      document.querySelectorAll('[data-tipo]').forEach(b => b.classList.remove('active'));
+      root.querySelectorAll('[data-tipo]').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       wsTipo = btn.dataset.tipo;
 
