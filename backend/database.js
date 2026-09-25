@@ -2,6 +2,9 @@
 // + Módulo de MESAS e GARÇONS
 // + FIX Bug #2b: print_status em order_items (envio para cozinha, só MESA)
 // + FIX Ciclo 1 (AM3-B): orders.cash_register_id (associação pedido ↔ caixa)
+// + FIX Ciclo 4 / AUD-ME-02: table_force_free_log (auditoria de force-free)
+// + FIX Ciclo 5 / AUD-ARQ-01: order_items.is_additional (natureza do item)
+// + FIX Ciclo 6 / AUD-PG-07: payments_refunds (estornos) + CHECK ESTORNO em cash_movements
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -74,7 +77,6 @@ CREATE TABLE IF NOT EXISTS tables (
 );
 
 -- ORDERS (Seção 5 — PDV | Seção 12 — WhatsApp | Seção 13 — Status)
--- Nota: o CHECK do channel é recriado abaixo caso o banco seja antigo
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   number INTEGER,
@@ -97,8 +99,6 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 -- ORDER_ITEMS (Seção 5.2 — Informações da venda)
--- FIX Bug #2b: print_status controla envio para cozinha (só MESA)
---   0 = PENDENTE, 1 = ENVIADO
 CREATE TABLE IF NOT EXISTS order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -135,11 +135,11 @@ CREATE TABLE IF NOT EXISTS cash_registers (
   status TEXT NOT NULL DEFAULT 'ABERTO' CHECK(status IN ('ABERTO','FECHADO'))
 );
 
--- CASH_MOVEMENTS (Seção 16 — Vendas, Entradas, Saídas)
+-- CASH_MOVEMENTS (Seção 16 — Vendas, Entradas, Saídas, Estornos)
 CREATE TABLE IF NOT EXISTS cash_movements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   register_id INTEGER REFERENCES cash_registers(id),
-  type TEXT NOT NULL CHECK(type IN ('VENDA','ENTRADA','SAIDA')),
+  type TEXT NOT NULL CHECK(type IN ('VENDA','ENTRADA','SAIDA','ESTORNO')),
   description TEXT,
   amount REAL NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -206,8 +206,6 @@ CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
 
 // ============================================================
 // TABELA DE AUDITORIA — force-free de mesa (Ciclo 4 / AUD-ME-02)
-// Registra toda liberação forçada de mesa, com motivo e timestamp.
-// Criada de forma idempotente para não quebrar bancos existentes.
 // ============================================================
 db.exec(`
   CREATE TABLE IF NOT EXISTS table_force_free_log (
@@ -228,6 +226,38 @@ try {
   console.log(`⚠️  idx_table_force_free_table: ${e.message}`);
 }
 
+// ============================================================
+// TABELA DE ESTORNOS — Ciclo 6 / AUD-PG-07
+// payments permanece imutável; estornos são eventos novos.
+// ============================================================
+db.exec(`
+  CREATE TABLE IF NOT EXISTS payments_refunds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payment_id INTEGER NOT NULL REFERENCES payments(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    amount REAL NOT NULL CHECK(amount > 0),
+    reason TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_payments_refunds_order
+      ON payments_refunds(order_id)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_payments_refunds_order: ${e.message}`);
+}
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_payments_refunds_payment
+      ON payments_refunds(payment_id)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_payments_refunds_payment: ${e.message}`);
+}
 
 // ============================================================
 // MIGRAÇÕES — adiciona colunas em bancos antigos
@@ -241,12 +271,8 @@ const migrations = [
   ['products', 'barcode',   'ALTER TABLE products ADD COLUMN barcode TEXT'],
   ['orders',   'table_id',  'ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES tables(id)'],
   ['orders',   'waiter_id', 'ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)'],
-  // FIX Bug #2b: estado de envio para cozinha (só MESA)
   ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0'],
-  // FIX Ciclo 1 (AM3-B): associação pedido ↔ caixa
   ['orders', 'cash_register_id', 'ALTER TABLE orders ADD COLUMN cash_register_id INTEGER REFERENCES cash_registers(id)'],
-  // FIX Ciclo 5 / AUD-ARQ-01: persistir natureza do item (produto vs adicional).
-  // Itens antigos ficam com DEFAULT 0 automaticamente.
   ['order_items', 'is_additional', 'ALTER TABLE order_items ADD COLUMN is_additional INTEGER NOT NULL DEFAULT 0']
 ];
 
@@ -282,8 +308,55 @@ try {
 }
 
 // ============================================================
+// MIGRATION Ciclo 6 / AUD-PG-07: CHECK do cash_movements
+// precisa aceitar 'ESTORNO'. SQLite não permite ALTER direto,
+// então recriamos a tabela.
+// ============================================================
+function cashMovementsAceitaEstorno() {
+  try {
+    const row = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type='table' AND name='cash_movements'
+    `).get();
+    return row && row.sql && row.sql.includes("'ESTORNO'");
+  } catch {
+    return false;
+  }
+}
+
+if (!cashMovementsAceitaEstorno()) {
+  console.log('');
+  console.log('🔧 Migração: recriando cash_movements para aceitar ESTORNO...');
+
+  db.exec(`
+    BEGIN TRANSACTION;
+
+    CREATE TABLE cash_movements_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      register_id INTEGER REFERENCES cash_registers(id),
+      type TEXT NOT NULL CHECK(type IN ('VENDA','ENTRADA','SAIDA','ESTORNO')),
+      description TEXT,
+      amount REAL NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT INTO cash_movements_new (id, register_id, type, description, amount, created_at)
+      SELECT id, register_id, type, description, amount, created_at FROM cash_movements;
+
+    DROP TABLE cash_movements;
+
+    ALTER TABLE cash_movements_new RENAME TO cash_movements;
+
+    CREATE INDEX IF NOT EXISTS idx_cash_mov_register ON cash_movements(register_id);
+
+    COMMIT;
+  `);
+
+  console.log('✅ Migração aplicada: cash_movements aceita ESTORNO');
+  console.log('');
+}
+
+// ============================================================
 // VERIFICA SE O CHECK DO channel PERMITE 'MESA'
-// Se o banco é antigo, precisa recriar a tabela orders
 // ============================================================
 function ordersChannelAceitaMesa() {
   try {

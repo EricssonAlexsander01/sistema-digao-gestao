@@ -4,11 +4,13 @@ console.log('🧹 Zerando dados operacionais...');
 
 // FIX Ciclo 4 / AUD-ME-02: incluir table_force_free_log antes de apagar
 // orders/tables (FK sem ON DELETE CASCADE).
+// FIX Ciclo 6 / AUD-PG-07: incluir payments_refunds antes de payments.
 // Envolvido em transação: se uma etapa falhar, nada é apagado.
 
 const zerar = db.transaction(() => {
-  // 1. Auditoria primeiro (referencia orders e tables)
+  // 1. Auditoria e estornos primeiro (referenciam orders/payments)
   db.exec(`DELETE FROM table_force_free_log;`);
+  db.exec(`DELETE FROM payments_refunds;`);
 
   // 2. Dados operacionais
   db.exec(`
@@ -27,6 +29,7 @@ const zerar = db.transaction(() => {
   db.exec(`
     DELETE FROM sqlite_sequence WHERE name IN (
       'table_force_free_log',
+      'payments_refunds',
       'orders','order_items','payments','deliveries','driver_payments',
       'cash_registers','cash_movements','expenses','losses'
     );

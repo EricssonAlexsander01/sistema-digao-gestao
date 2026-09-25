@@ -2,30 +2,18 @@
 // + Módulo de Mesas e Garçons
 // + Módulo de Impressão (Bematech MP-4200 TH)
 // + FIX Bug #1: 1 mesa = 1 pedido ativo
-// + Separação de estado OPERACIONAL vs FINANCEIRO
 // + FIX Bug #2: impressão automática para TODOS os canais
 // + FIX Bug #4: timezone local em todas as queries de data
 // + FIX Bug #2b: envio explícito para cozinha (só MESA)
 // + FIX v1.6.1: todo pagamento exige caixa aberto (RN017)
-// + FIX Ciclo 1 Etapa 2: helpers financeiros
-// + FIX Ciclo 1 Etapa 3: múltiplos pagamentos + saldo + transação atômica
-// + FIX Ciclo 1 Etapa 4: financial_status derivado em todas as consultas
-// + FIX Ciclo 1 Etapa 6: cash/close bloqueia com pendências financeiras
-// + FIX Ciclo 1 Etapa 8: cash/movement valida amount (RN027/RN028/RN029)
-// + FIX Ciclo 2: POST /orders valida itens, consulta produto no banco,
-//   ignora name/price do payload (AUD-PD-01..05 / F-P) e executa
-//   order + order_items em transação atômica com nextNum interno.
-// + FIX Ciclo 3 / AUD-ME-07: (frontend) separação entre itens existentes
-//   e itens novos no PDV modo mesa.
-// + FIX Ciclo 4 / AUD-ME-02: force-free com motivo obrigatório, auditoria
-//   (table_force_free_log) e desvinculação do pedido (table_id = NULL).
-// + FIX Ciclo 4 / AUD-ME-05: nova rota PUT /tables/:id/waiter para trocar
-//   garçom sem alterar orders.waiter_id (histórico preservado).
-// + FIX Ciclo 4 / AUD-ME-06: getActiveOrderByTable nunca retorna pedido
-//   com financial_status = 'PAGO'.
-// + FIX Ciclo 5 / AUD-ARQ-01: order_items persiste is_additional (natureza
-//   do item, vinda de products.is_additional). Comanda em texto e impressa
-//   marcam adicionais com prefixo '+ '.
+// + FIX Ciclo 1: helpers financeiros, multi-pagamentos, saldo, cash/close
+// + FIX Ciclo 2 / AUD-PD-01..05: validação server-side de itens
+// + FIX Ciclo 3 / AUD-ME-07: separação itens existentes vs novos
+// + FIX Ciclo 4 / AUD-ME-02 / 05 / 06: force-free c/ auditoria, waiter, pedido PAGO inativo
+// + FIX Ciclo 5 / AUD-ARQ-01: order_items.is_additional + marcação em comanda
+// + FIX Ciclo 6 / AUD-PG-07: estorno (payments_refunds), financial_status ESTORNADO,
+//   cash_movements ESTORNO, endpoints de histórico de caixa
+// + FIX Ciclo 6 / BUG-D: expõe payments (plural) preservando payment (singular)
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -55,9 +43,7 @@ function getOpenCashRegister() {
   ).get();
 }
 
-// FIX Ciclo 4 / AUD-ME-06: pedido financeiramente PAGO nunca é
-// tratado como pedido operacional ativo. Itera os candidatos e
-// devolve o primeiro cujo financial_status NÃO seja 'PAGO'.
+// FIX Ciclo 4 / AUD-ME-06: pedido PAGO não é ativo.
 function getActiveOrderByTable(tableId) {
   const candidatos = db.prepare(`
     SELECT * FROM orders
@@ -66,7 +52,8 @@ function getActiveOrderByTable(tableId) {
   `).all(tableId);
 
   for (const pedido of candidatos) {
-    if (getOrderFinancialStatus(pedido.id) !== 'PAGO') {
+    const fs = getOrderFinancialStatus(pedido.id);
+    if (fs !== 'PAGO' && fs !== 'ESTORNADO') {
       return pedido;
     }
   }
@@ -94,10 +81,11 @@ function getPendingItems(orderId) {
 }
 
 // ============================================================
-// HELPERS FINANCEIROS (Ciclo 1)
+// HELPERS FINANCEIROS
 // ============================================================
 
-function getOrderPaymentsTotal(orderId) {
+// Total BRUTO pago (soma dos pagamentos originais, ignorando estornos)
+function getOrderGrossPaid(orderId) {
   const row = db.prepare(`
     SELECT COALESCE(SUM(amount), 0) AS total
     FROM payments
@@ -106,32 +94,70 @@ function getOrderPaymentsTotal(orderId) {
   return Number(row.total) || 0;
 }
 
+// Total já estornado do pedido
+function getOrderRefundsTotal(orderId) {
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM payments_refunds
+    WHERE order_id = ?
+  `).get(orderId);
+  return Number(row.total) || 0;
+}
+
+// Valor LÍQUIDO pago = pagamentos - estornos
+function getOrderNetPaid(orderId) {
+  const gross = getOrderGrossPaid(orderId);
+  const refunded = getOrderRefundsTotal(orderId);
+  return Math.max(0, gross - refunded);
+}
+
+// Compatibilidade: outras partes ainda usam "getOrderPaymentsTotal"
+function getOrderPaymentsTotal(orderId) {
+  return getOrderNetPaid(orderId);
+}
+
 function getOrderRemaining(orderId) {
   const order = db.prepare('SELECT total FROM orders WHERE id = ?').get(orderId);
   if (!order) return 0;
-  const paid = getOrderPaymentsTotal(orderId);
+  const paid = getOrderNetPaid(orderId);
   const remaining = Number(order.total) - paid;
   return remaining > 0 ? remaining : 0;
 }
 
+// FIX Ciclo 6: retorna ESTORNADO quando houve pagamento e o líquido caiu a zero
 function getOrderFinancialStatus(orderId) {
   const order = db.prepare('SELECT total FROM orders WHERE id = ?').get(orderId);
   if (!order) return 'ABERTO';
 
   const total = Number(order.total) || 0;
-  const paid = getOrderPaymentsTotal(orderId);
+  const grossPaid = getOrderGrossPaid(orderId);
+  const netPaid = getOrderNetPaid(orderId);
 
-  if (paid <= 0) return 'ABERTO';
-  if (Math.abs(paid - total) < 0.01 || paid > total) return 'PAGO';
+  if (grossPaid <= 0) return 'ABERTO';
+  if (netPaid <= 0) return 'ESTORNADO';
+
+  if (Math.abs(netPaid - total) < 0.01 || netPaid > total) return 'PAGO';
   return 'PARCIAL';
 }
 
 function enrichOrderFinancials(order) {
   if (!order) return order;
   order.financial_status = getOrderFinancialStatus(order.id);
-  order.payments_total = getOrderPaymentsTotal(order.id);
+  order.payments_total = getOrderNetPaid(order.id);
+  order.refunds_total = getOrderRefundsTotal(order.id);
   order.remaining = getOrderRemaining(order.id);
   return order;
+}
+
+// Quanto ainda é estornável de um pagamento específico
+function getPaymentRefundable(paymentId) {
+  const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
+  if (!payment) return 0;
+  const refunded = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM payments_refunds WHERE payment_id = ?
+  `).get(paymentId).total;
+  return Math.max(0, Number(payment.amount) - Number(refunded));
 }
 
 // ============================================================
@@ -142,7 +168,7 @@ app.get('/api', (req, res) => {
     sistema: 'Digão Gestão',
     versao: '1.6.2',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
-    modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão']
+    modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão', 'Estorno']
   });
 });
 
@@ -334,9 +360,6 @@ app.post('/api/tables/:id/close', (req, res) => {
   res.json({ ok: true });
 });
 
-// FIX Ciclo 4 / AUD-ME-02: force-free com motivo obrigatório,
-// auditoria e desvinculação do pedido operacional (table_id = NULL),
-// tudo em transação atômica.
 app.post('/api/tables/:id/force-free', (req, res) => {
   const tableId = Number(req.params.id);
   const { reason } = req.body || {};
@@ -396,8 +419,6 @@ app.post('/api/tables/:id/force-free', (req, res) => {
   }
 });
 
-// FIX Ciclo 4 / AUD-ME-05: troca de garçom de uma mesa.
-// Altera SOMENTE tables.waiter_id. Preserva orders.waiter_id (histórico).
 app.put('/api/tables/:id/waiter', (req, res) => {
   const tableId = Number(req.params.id);
   const { waiter_id } = req.body || {};
@@ -443,7 +464,9 @@ app.get('/api/orders', (req, res) => {
   const orders = db.prepare(sql).all(...params);
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
-    o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
+    // BUG-D FIX: expõe payments (plural) e mantém payment (singular) para compatibilidade
+    o.payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(o.id);
+    o.payment = o.payments[0] || null;
     enrichOrderFinancials(o);
     if (o.table_id) {
       o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
@@ -459,7 +482,9 @@ app.get('/api/orders/:id', (req, res) => {
   const o = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
   o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
-  o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
+  // BUG-D FIX: expõe payments (plural) e mantém payment (singular)
+  o.payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(o.id);
+  o.payment = o.payments[0] || null;
   enrichOrderFinancials(o);
   if (o.table_id) {
     o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
@@ -470,12 +495,6 @@ app.get('/api/orders/:id', (req, res) => {
   res.json(o);
 });
 
-// ============================================================
-// POST /api/orders — Ciclo 2 + Ciclo 5
-// Backend é a autoridade: valida itens, consulta products no banco
-// e usa name/price/active/is_additional reais. Payload nunca define
-// nome, preço nem natureza. Tudo em transação atômica.
-// ============================================================
 app.post('/api/orders', (req, res) => {
   const {
     channel, items, observation,
@@ -484,7 +503,6 @@ app.post('/api/orders', (req, res) => {
     table_id, waiter_id
   } = req.body;
 
-  // ---------- validação de canal e payload básico ----------
   if (!['BALCAO', 'WHATSAPP', 'MESA', 'IFOOD'].includes(channel)) {
     return res.status(400).json({ error: 'Canal inválido' });
   }
@@ -497,7 +515,6 @@ app.post('/api/orders', (req, res) => {
     return res.status(400).json({ error: 'Pedido de mesa precisa de table_id' });
   }
 
-  // ---------- validação + resolução de itens (AUD-PD-01..05 / F-P + AUD-ARQ-01) ----------
   const itensResolvidos = [];
   for (const it of items) {
     if (!it || typeof it !== 'object') {
@@ -514,7 +531,6 @@ app.post('/api/orders', (req, res) => {
       return res.status(400).json({ error: 'Quantidade inválida no item' });
     }
 
-    // FIX Ciclo 5 / AUD-ARQ-01: precisa incluir is_additional no SELECT
     const prod = db.prepare('SELECT id, name, price, active, is_additional FROM products WHERE id = ?').get(productId);
     if (!prod) {
       return res.status(400).json({ error: `Produto ${productId} não encontrado` });
@@ -532,7 +548,6 @@ app.post('/api/orders', (req, res) => {
       observation: (it.observation != null && String(it.observation).trim())
         ? String(it.observation).trim()
         : null,
-      // FIX Ciclo 5 / AUD-ARQ-01: persistir natureza do item
       is_additional: prod.is_additional ? 1 : 0
     });
   }
@@ -541,7 +556,6 @@ app.post('/api/orders', (req, res) => {
   const fee = Number(delivery_fee || 0);
   const total = subtotal + fee;
 
-  // ---------- transação atômica ----------
   try {
     const executar = db.transaction(() => {
 
@@ -564,7 +578,6 @@ app.post('/api/orders', (req, res) => {
         const pedidoExistente = getActiveOrderByTable(table_id);
 
         if (pedidoExistente) {
-          // FIX Ciclo 5 / AUD-ARQ-01: persistir is_additional na adição a MESA
           const insertItem = db.prepare(`
             INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status, is_additional)
             VALUES (?,?,?,?,?,?,0,?)
@@ -598,7 +611,7 @@ app.post('/api/orders', (req, res) => {
             itensAdicionados: itensResolvidos.length,
             jaExistia: true,
             financial_status: getOrderFinancialStatus(pedidoExistente.id),
-            payments_total: getOrderPaymentsTotal(pedidoExistente.id),
+            payments_total: getOrderNetPaid(pedidoExistente.id),
             remaining: getOrderRemaining(pedidoExistente.id)
           };
         }
@@ -621,7 +634,6 @@ app.post('/api/orders', (req, res) => {
       );
 
       const orderId = result.lastInsertRowid;
-      // FIX Ciclo 5 / AUD-ARQ-01: persistir is_additional no fluxo padrão
       const insertItem = db.prepare(`
         INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status, is_additional)
         VALUES (?,?,?,?,?,?,0,?)
@@ -664,7 +676,7 @@ app.put('/api/orders/:id', (req, res) => {
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado' });
 
   if (status === 'CANCELADO') {
-    const total = getOrderPaymentsTotal(req.params.id);
+    const total = getOrderNetPaid(req.params.id);
     if (total > 0) {
       return res.status(400).json({
         error: 'RN016: Pedido já possui pagamento registrado. Estorne o pagamento antes de cancelar.'
@@ -697,6 +709,14 @@ app.post('/api/orders/:id/payment', (req, res) => {
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!order) {
     return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
+
+  // FIX Ciclo 6: pedido totalmente estornado não aceita novo pagamento
+  const fsAtual = getOrderFinancialStatus(order.id);
+  if (fsAtual === 'ESTORNADO') {
+    return res.status(400).json({
+      error: 'RN031: Pedido totalmente estornado não pode receber novo pagamento.'
+    });
   }
 
   const register = getOpenCashRegister();
@@ -804,11 +824,12 @@ app.post('/api/orders/:id/payment', (req, res) => {
       WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
     `).all(order.table_id);
 
-    const todosPagos = pedidosAtivos.every(p =>
-      getOrderFinancialStatus(p.id) === 'PAGO'
-    );
+    const todosEmEstadoFinal = pedidosAtivos.every(p => {
+      const fs = getOrderFinancialStatus(p.id);
+      return fs === 'PAGO' || fs === 'ESTORNADO';
+    });
 
-    if (todosPagos) {
+    if (todosEmEstadoFinal) {
       db.prepare(`
         UPDATE tables
         SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
@@ -854,6 +875,152 @@ app.post('/api/orders/:id/payment', (req, res) => {
     financial_status: novoFinancialStatus,
     remaining: getOrderRemaining(order.id)
   });
+});
+
+// ============================================================
+// REFUND (Estorno) — Ciclo 6 / AUD-PG-07
+// ============================================================
+app.post('/api/orders/:id/refund', (req, res) => {
+  const orderId = Number(req.params.id);
+  const { amount, reason, payment_id } = req.body || {};
+
+  // Validações
+  if (!reason || typeof reason !== 'string' || reason.trim().length < 3) {
+    return res.status(400).json({ error: 'RN032: Motivo obrigatório (mínimo 3 caracteres).' });
+  }
+
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    return res.status(400).json({ error: 'RN033: Valor do estorno deve ser positivo.' });
+  }
+
+  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  if (!order) {
+    return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
+
+  const netPaid = getOrderNetPaid(orderId);
+  if (netPaid <= 0) {
+    return res.status(400).json({ error: 'RN034: Pedido não possui valor líquido a estornar.' });
+  }
+
+  if (amt > netPaid + 0.01) {
+    return res.status(400).json({
+      error: `RN035: Valor excede o líquido estornável (R$ ${netPaid.toFixed(2)}).`
+    });
+  }
+
+  const register = getOpenCashRegister();
+  if (!register) {
+    return res.status(400).json({
+      error: 'RN017: Nenhum caixa aberto. Abra o caixa antes de estornar.'
+    });
+  }
+
+  const motivoLimpo = reason.trim();
+
+  try {
+    const executar = db.transaction(() => {
+      const refunds = []; // registros a inserir em payments_refunds
+      let restante = amt;
+
+      if (payment_id != null) {
+        // Caminho A: estorno direcionado a um pagamento específico
+        const pid = Number(payment_id);
+        if (!Number.isInteger(pid) || pid <= 0) {
+          const err = new Error('payment_id inválido');
+          err.status = 400;
+          throw err;
+        }
+        const payment = db.prepare('SELECT * FROM payments WHERE id = ? AND order_id = ?').get(pid, orderId);
+        if (!payment) {
+          const err = new Error('Pagamento não encontrado neste pedido');
+          err.status = 400;
+          throw err;
+        }
+        const refundable = getPaymentRefundable(pid);
+        if (amt > refundable + 0.01) {
+          const err = new Error(`RN036: Valor excede o estornável deste pagamento (R$ ${refundable.toFixed(2)}).`);
+          err.status = 400;
+          throw err;
+        }
+        refunds.push({ payment_id: pid, amount: amt });
+      } else {
+        // Caminho B: FIFO sobre pagamentos elegíveis
+        const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(orderId);
+        for (const p of payments) {
+          if (restante <= 0) break;
+          const refundable = getPaymentRefundable(p.id);
+          if (refundable <= 0) continue;
+          const usar = Math.min(refundable, restante);
+          refunds.push({ payment_id: p.id, amount: Number(usar.toFixed(2)) });
+          restante -= usar;
+        }
+        if (restante > 0.01) {
+          const err = new Error('RN037: Não há saldo estornável suficiente nos pagamentos do pedido.');
+          err.status = 400;
+          throw err;
+        }
+      }
+
+      // Insere os refunds
+      const insertRefund = db.prepare(`
+        INSERT INTO payments_refunds (payment_id, order_id, amount, reason)
+        VALUES (?, ?, ?, ?)
+      `);
+      refunds.forEach(r => insertRefund.run(r.payment_id, orderId, r.amount, motivoLimpo));
+
+      // Cria um único cash_movement de ESTORNO com o total
+      db.prepare(`
+        INSERT INTO cash_movements (register_id, type, description, amount)
+        VALUES (?, 'ESTORNO', ?, ?)
+      `).run(register.id, `Estorno Pedido #${order.number} — ${motivoLimpo}`, amt);
+
+      // Verifica se a mesa pode ser liberada
+      if (order.table_id) {
+        const pedidosAtivos = db.prepare(`
+          SELECT id FROM orders
+          WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
+        `).all(order.table_id);
+
+        const todosEmEstadoFinal = pedidosAtivos.every(p => {
+          const fs = getOrderFinancialStatus(p.id);
+          return fs === 'PAGO' || fs === 'ESTORNADO';
+        });
+
+        if (todosEmEstadoFinal) {
+          db.prepare(`
+            UPDATE tables
+            SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(order.table_id);
+        }
+      }
+
+      return { refunds };
+    });
+
+    const resultado = executar();
+    const novoStatus = getOrderFinancialStatus(orderId);
+
+    res.json({
+      ok: true,
+      order_id: orderId,
+      refunded_amount: amt,
+      refunds_created: resultado.refunds.length,
+      financial_status: novoStatus,
+      net_paid: getOrderNetPaid(orderId),
+      remaining: getOrderRemaining(orderId),
+      refunds_total: getOrderRefundsTotal(orderId)
+    });
+
+  } catch (e) {
+    if (e.status === 400) {
+      return res.status(400).json({ error: e.message });
+    }
+    console.error('[refund] erro na transação:', e);
+    return res.status(500).json({ error: 'Erro ao registrar estorno' });
+  }
 });
 
 // ============================================================
@@ -925,13 +1092,21 @@ app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
 app.get('/api/orders/:id/financial', (req, res) => {
   const o = db.prepare('SELECT id FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
-  const payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(req.params.id);
+
+  // BUG-D FIX: expõe payments (plural) e mantém payment (singular)
+  const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(req.params.id);
+  const refunds = db.prepare('SELECT * FROM payments_refunds WHERE order_id = ? ORDER BY id ASC').all(req.params.id);
+
   res.json({
     order_id: Number(req.params.id),
     financial_status: getOrderFinancialStatus(req.params.id),
-    payments_total: getOrderPaymentsTotal(req.params.id),
+    payments_total: getOrderNetPaid(req.params.id),
+    gross_paid: getOrderGrossPaid(req.params.id),
+    refunds_total: getOrderRefundsTotal(req.params.id),
     remaining: getOrderRemaining(req.params.id),
-    payment: payment || null
+    payment: payments[0] || null,
+    payments,
+    refunds
   });
 });
 
@@ -962,7 +1137,6 @@ app.get('/api/orders/:id/comanda', (req, res) => {
   txt += `Data: ${o.created_at}\n`;
   txt += `Canal: ${o.channel}\n`;
   txt += '--------------------------------\n';
-  // FIX Ciclo 5 / AUD-ARQ-01: marcar adicionais com prefixo '+'
   items.forEach(it => {
     const prefixo = it.is_additional ? '+ ' : '  ';
     txt += `${prefixo}${it.quantity}x ${it.name.padEnd(20)} R$ ${(it.price * it.quantity).toFixed(2)}\n`;
@@ -1033,8 +1207,9 @@ app.get('/api/cash/current', (req, res) => {
   const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
   const entries = movements.filter(m => m.type === 'ENTRADA').reduce((s, m) => s + m.amount, 0);
   const exits = movements.filter(m => m.type === 'SAIDA').reduce((s, m) => s + m.amount, 0);
-  const current = reg.initial_value + sales + entries - exits;
-  res.json({ ...reg, movements, sales, entries, exits, current });
+  const refunds = movements.filter(m => m.type === 'ESTORNO').reduce((s, m) => s + m.amount, 0);
+  const current = reg.initial_value + sales + entries - exits - refunds;
+  res.json({ ...reg, movements, sales, entries, exits, refunds, current });
 });
 
 app.post('/api/cash/open', (req, res) => {
@@ -1106,7 +1281,8 @@ app.post('/api/cash/close', (req, res) => {
   const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
   const entries = movements.filter(m => m.type === 'ENTRADA').reduce((s, m) => s + m.amount, 0);
   const exits = movements.filter(m => m.type === 'SAIDA').reduce((s, m) => s + m.amount, 0);
-  const expected = reg.initial_value + sales + entries - exits;
+  const refunds = movements.filter(m => m.type === 'ESTORNO').reduce((s, m) => s + m.amount, 0);
+  const expected = reg.initial_value + sales + entries - exits - refunds;
   const diff = Number(informed_value) - expected;
 
   db.prepare(`
@@ -1149,6 +1325,75 @@ app.get('/api/cash/movements', (req, res) => {
   res.json(db.prepare(
     'SELECT * FROM cash_movements WHERE register_id = ? ORDER BY id DESC'
   ).all(reg.id));
+});
+
+// ============================================================
+// CASH HISTORY — Ciclo 6
+// ============================================================
+app.get('/api/cash/history', (req, res) => {
+  const { from, to, page = 1, limit = 20 } = req.query;
+
+  const limitNum = Math.min(Math.max(parseInt(limit) || 20, 1), 100);
+  const pageNum = Math.max(parseInt(page) || 1, 1);
+  const offset = (pageNum - 1) * limitNum;
+
+  const where = ["status = 'FECHADO'"];
+  const params = [];
+
+  if (from) {
+    where.push("date(closed_at, 'localtime') >= date(?)");
+    params.push(from);
+  }
+  if (to) {
+    where.push("date(closed_at, 'localtime') <= date(?)");
+    params.push(to);
+  }
+
+  const whereSQL = 'WHERE ' + where.join(' AND ');
+
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM cash_registers ${whereSQL}`).get(...params).n;
+
+  const rows = db.prepare(`
+    SELECT * FROM cash_registers
+    ${whereSQL}
+    ORDER BY id DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, limitNum, offset);
+
+  // Enriquece cada caixa com agregados de cash_movements
+  const items = rows.map(r => {
+    const movements = db.prepare('SELECT * FROM cash_movements WHERE register_id = ?').all(r.id);
+    const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
+    const entries = movements.filter(m => m.type === 'ENTRADA').reduce((s, m) => s + m.amount, 0);
+    const exits = movements.filter(m => m.type === 'SAIDA').reduce((s, m) => s + m.amount, 0);
+    const refunds = movements.filter(m => m.type === 'ESTORNO').reduce((s, m) => s + m.amount, 0);
+    return { ...r, sales, entries, exits, refunds };
+  });
+
+  res.json({
+    items,
+    page: pageNum,
+    limit: limitNum,
+    total,
+    total_pages: Math.ceil(total / limitNum)
+  });
+});
+
+app.get('/api/cash/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const reg = db.prepare('SELECT * FROM cash_registers WHERE id = ?').get(id);
+  if (!reg) return res.status(404).json({ error: 'Caixa não encontrado' });
+
+  const movements = db.prepare(
+    'SELECT * FROM cash_movements WHERE register_id = ? ORDER BY id DESC'
+  ).all(id);
+
+  const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
+  const entries = movements.filter(m => m.type === 'ENTRADA').reduce((s, m) => s + m.amount, 0);
+  const exits = movements.filter(m => m.type === 'SAIDA').reduce((s, m) => s + m.amount, 0);
+  const refunds = movements.filter(m => m.type === 'ESTORNO').reduce((s, m) => s + m.amount, 0);
+
+  res.json({ ...reg, movements, sales, entries, exits, refunds });
 });
 
 // ============================================================

@@ -1,10 +1,10 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Pedidos (com envio para entrega)
-   FIX Ciclo 5 / AUD-ARQ-01: modal de detalhes marca adicionais
-     com prefixo '+' e destaque visual.
-   FIX Ciclo 5 / AUD-ENT-01: modal de envio agora permite editar
-     a taxa da entrega (fee) por pedido, pré-preenchida com o
-     default_fee do entregador.
+   FIX Ciclo 5 / AUD-ARQ-01: modal de detalhes marca adicionais.
+   FIX Ciclo 5 / AUD-ENT-01: modal de envio permite editar taxa.
+   FIX Ciclo 6 / BUG-D: modal de detalhes agora lista TODOS os
+     pagamentos (plural). Fallback para payment (singular) caso
+     o backend antigo seja acessado.
    ============================================================ */
 
 let pedidosFiltro = { status: '', channel: '', date: '' };
@@ -14,7 +14,6 @@ let driversCache = [];
 // LOADER PRINCIPAL
 // ============================================================
 window.loadPedidos = async function (container) {
-  // Carrega entregadores para o modal de envio
   driversCache = await Digao.get('/drivers');
 
   container.innerHTML = renderPedidosLayout();
@@ -178,7 +177,6 @@ function bindPedidosEvents() {
 
 // ============================================================
 // MODAL — ENVIAR PARA ENTREGA
-// FIX Ciclo 5 / AUD-ENT-01: taxa editável por pedido.
 // ============================================================
 function abrirModalEnvio(orderId) {
   const html = `
@@ -269,14 +267,12 @@ function abrirModalEnvio(orderId) {
       btn.style.borderColor = 'var(--border)';
     });
     btn.addEventListener('click', () => {
-      // Remove seleção anterior
       m.overlay.querySelectorAll('.driver-pick').forEach(b => {
         b.dataset.selected = '0';
         b.style.background = 'var(--bg-dark)';
         b.style.borderColor = 'var(--border)';
       });
 
-      // Marca este como selecionado
       btn.dataset.selected = '1';
       btn.style.background = 'rgba(251,191,36,0.12)';
       btn.style.borderColor = 'var(--primary)';
@@ -287,7 +283,6 @@ function abrirModalEnvio(orderId) {
         fee: Number(btn.dataset.driverFee)
       };
 
-      // Pré-preenche taxa com default_fee do entregador
       taxaInput.value = driverSelecionado.fee.toFixed(2);
       taxaWrap.style.display = 'block';
       validar();
@@ -325,13 +320,18 @@ function abrirModalEnvio(orderId) {
 
 // ============================================================
 // DETALHES DO PEDIDO
-// FIX Ciclo 5 / AUD-ARQ-01: marca adicionais com prefixo '+'
+// FIX Ciclo 5 / AUD-ARQ-01: marca adicionais
+// FIX Ciclo 6 / BUG-D: lista TODOS os pagamentos
 // ============================================================
 async function abrirDetalhesPedido(id) {
   const order = await Digao.get(`/orders/${id}`);
   const comanda = await Digao.get(`/orders/${id}/comanda`);
 
   const statusOptions = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
+
+  // BUG-D: usa payments (plural) com fallback para payment (singular)
+  const payments = Array.isArray(order.payments) ? order.payments : (order.payment ? [order.payment] : []);
+  const refunds = Array.isArray(order.refunds) ? order.refunds : [];
 
   const html = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
@@ -389,11 +389,33 @@ async function abrirDetalhesPedido(id) {
       <div style="display:flex;justify-content:space-between;padding-top:8px;border-top:1px dashed var(--border);font-weight:800;font-size:15px">
         <span>Total</span><span style="color:var(--primary)">${Digao.money(order.total)}</span>
       </div>
-      ${order.payment ? `
-        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:var(--text-muted)">
-          Pago via <strong style="color:var(--text-main)">${order.payment.method}</strong>
-          ${order.payment.change_amount > 0 ? ` · Troco: <strong style="color:var(--success)">${Digao.money(order.payment.change_amount)}</strong>` : ''}
-        </div>` : ''}
+
+      ${payments.length > 0 ? `
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--text-muted);font-weight:600;margin-bottom:6px">PAGAMENTOS (${payments.length})</div>
+          ${payments.map(p => `
+            <div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">
+              <span>${formatPaymentMethod(p.method)}${p.change_amount > 0 ? ` · troco ${Digao.money(p.change_amount)}` : ''}</span>
+              <strong style="color:var(--text-main)">${Digao.money(p.amount)}</strong>
+            </div>
+          `).join('')}
+          ${refunds.length > 0 ? `
+            <div style="font-size:11px;color:var(--warning);font-weight:600;margin-top:10px;margin-bottom:6px">ESTORNOS (${refunds.length})</div>
+            ${refunds.map(r => `
+              <div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--warning)">
+                <span>${escapeHtml(r.reason)}</span>
+                <strong>− ${Digao.money(r.amount)}</strong>
+              </div>
+            `).join('')}
+          ` : ''}
+        </div>
+      ` : ''}
+
+      ${order.financial_status === 'ESTORNADO' ? `
+        <div style="margin-top:10px;padding:8px 10px;background:rgba(245,158,11,0.12);border-radius:6px;font-size:12px;color:var(--warning);text-align:center;font-weight:700">
+          Pedido totalmente estornado
+        </div>
+      ` : ''}
     </div>
 
     <div style="margin-bottom:14px">
@@ -439,6 +461,15 @@ async function abrirDetalhesPedido(id) {
 // ============================================================
 // HELPERS
 // ============================================================
+function formatPaymentMethod(m) {
+  return {
+    'PIX': '⚡ Pix',
+    'DINHEIRO': '💵 Dinheiro',
+    'DEBITO': '💳 Débito',
+    'CREDITO': '💳 Crédito'
+  }[m] || m;
+}
+
 function escapeHtml(str) {
   if (str == null) return '';
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
