@@ -1,15 +1,15 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo WhatsApp
    Pedidos recebidos via WhatsApp — Retirada ou Entrega
-   FIX Bug #3: listener de clique agora vive em #ws-root (recriado
-   a cada render), eliminando o acúmulo que causava adição múltipla
-   de itens ao navegar repetidamente pelo módulo.
+   FIX Bug #3: listener de clique agora vive em #ws-root.
+   FIX Ciclo 8 / DEC-02: campo de observação geral do pedido.
+   FIX Ciclo 8 / DEC-03: campo de valor recebido (troco) para DINHEIRO.
    ============================================================ */
 
 let wsProdutos = [];
 let wsCategorias = [];
 let wsCarrinho = [];
-let wsTipo = 'ENTREGA'; // ou 'RETIRADA'
+let wsTipo = 'ENTREGA';
 let wsFormaPgto = 'PIX';
 let wsFiltroCat = 'Todos';
 
@@ -35,9 +35,6 @@ window.loadWhatsApp = async function (container) {
 
 // ============================================================
 // LAYOUT
-// FIX Bug #3 — todo o HTML é envolvido em #ws-root.
-// O listener de clique é registrado nesse elemento, que é
-// destruído e recriado a cada render.
 // ============================================================
 function renderWhatsAppLayout() {
   return `
@@ -74,19 +71,29 @@ function renderWhatsAppLayout() {
 
         <div class="cart-items" id="ws-cart-items"></div>
 
-        <!-- Botão que abre o modal de dados -->
         <button class="btn btn-secondary" id="ws-btn-dados" style="margin:12px 20px;width:calc(100% - 40px)">
           <i class="fa-solid fa-user-pen"></i>
           <span id="ws-dados-label">Preencher dados de entrega</span>
         </button>
 
-        <!-- Campos escondidos (o modal escreve neles) -->
         <input type="hidden" id="ws-name" value="">
         <input type="hidden" id="ws-phone" value="">
         <input type="hidden" id="ws-address" value="">
         <input type="hidden" id="ws-neighborhood" value="">
         <input type="hidden" id="ws-complement" value="">
         <input type="hidden" id="ws-fee" value="8.00">
+
+        <!-- DEC-02: Observação geral -->
+        <div style="padding:12px 20px;border-top:1px solid var(--border)">
+          <label class="label" style="margin-bottom:6px;display:block">Observação do pedido</label>
+          <textarea
+            class="input"
+            id="ws-observation"
+            placeholder="Ex: Sem cebola, embalar separado, ponto da carne..."
+            rows="2"
+            style="resize:none;font-family:inherit;font-size:12.5px"
+          ></textarea>
+        </div>
 
         <div class="cart-summary">
           <div class="summary-row">
@@ -108,6 +115,21 @@ function renderWhatsAppLayout() {
           <button class="pay-btn active" data-method="PIX">Pix</button>
           <button class="pay-btn" data-method="DEBITO">Débito</button>
           <button class="pay-btn" data-method="CREDITO">Crédito</button>
+        </div>
+
+        <!-- DEC-03: campo de troco (só DINHEIRO) -->
+        <div class="troco-row hidden" id="ws-troco-row" style="margin:0 20px 12px">
+          <span>Troco para R$
+            <input
+              type="number"
+              id="ws-valor-recebido"
+              value="50"
+              step="1"
+              min="0"
+              style="width:70px;background:none;border:none;color:inherit;font-weight:700;font-size:12px;text-align:right;outline:none;font-family:inherit"
+            >
+          </span>
+          <span id="ws-troco">R$ 0,00</span>
         </div>
 
         <button class="confirm-btn" id="ws-confirm-btn" disabled>
@@ -179,26 +201,38 @@ function renderWsCarrinho() {
   document.getElementById('ws-taxa').textContent = Digao.money(taxa);
   document.getElementById('ws-total').textContent = Digao.money(total);
   document.getElementById('ws-confirm-btn').disabled = wsCarrinho.length === 0;
+
+  // DEC-03: atualiza troco se DINHEIRO
+  updateWsTroco(total);
+}
+
+// DEC-03: cálculo de troco no frontend
+function updateWsTroco(total) {
+  const trocoRow = document.getElementById('ws-troco-row');
+  if (!trocoRow) return;
+
+  if (wsFormaPgto === 'DINHEIRO') {
+    trocoRow.classList.remove('hidden');
+    const recebido = Number(document.getElementById('ws-valor-recebido')?.value) || 0;
+    const troco = recebido - total;
+    const trocoEl = document.getElementById('ws-troco');
+    if (trocoEl) {
+      trocoEl.textContent = Digao.money(Math.max(troco, 0));
+      trocoEl.style.color = troco >= 0 ? 'var(--success)' : 'var(--danger)';
+    }
+  } else {
+    trocoRow.classList.add('hidden');
+  }
 }
 
 // ============================================================
 // EVENTOS
-// FIX Bug #3 — todos os listeners são registrados em elementos
-// que vivem dentro de #ws-root (recriado a cada render), exceto
-// o listener de clique que agora usa #ws-root como delegate.
-// Nada mais é registrado em #app-view.
 // ============================================================
 function bindWhatsAppEvents() {
-  // FIX Bug #3 — o delegado de cliques vive em #ws-root.
-  // Este elemento é destruído a cada navegação, então o listener
-  // nunca acumula. Era o bug: antes o delegate vivia em #app-view,
-  // que é persistente entre navegações.
   const root = document.getElementById('ws-root');
 
-  // Botão "Preencher dados"
   document.getElementById('ws-btn-dados')?.addEventListener('click', abrirModalDadosCliente);
 
-  // Adicionar produto (delegado em #ws-root)
   root.addEventListener('click', (e) => {
     const card = e.target.closest('.product-card');
     if (card) {
@@ -211,7 +245,6 @@ function bindWhatsAppEvents() {
     }
   });
 
-  // Categorias
   root.querySelector('.categories').addEventListener('click', (e) => {
     const btn = e.target.closest('.cat-btn');
     if (!btn) return;
@@ -221,14 +254,12 @@ function bindWhatsAppEvents() {
     renderWsProdutos();
   });
 
-  // Tipo (Entrega / Retirada)
   root.querySelectorAll('[data-tipo]').forEach(btn => {
     btn.addEventListener('click', () => {
       root.querySelectorAll('[data-tipo]').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       wsTipo = btn.dataset.tipo;
 
-      // Atualiza o texto do botão de dados
       const label = document.getElementById('ws-dados-label');
       if (label) {
         const nome = document.getElementById('ws-name').value.trim();
@@ -247,16 +278,25 @@ function bindWhatsAppEvents() {
     });
   });
 
-  // Pagamento
   document.getElementById('ws-payment-methods').addEventListener('click', (e) => {
     const btn = e.target.closest('.pay-btn');
     if (!btn) return;
     document.querySelectorAll('#ws-payment-methods .pay-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     wsFormaPgto = btn.dataset.method;
+    renderWsCarrinho(); // atualiza troco
   });
 
-  // Carrinho +/-
+  // DEC-03: input de valor recebido
+  const valorRecebido = document.getElementById('ws-valor-recebido');
+  if (valorRecebido) {
+    valorRecebido.addEventListener('input', () => {
+      const subtotal = wsCarrinho.reduce((s, i) => s + i.price * i.quantity, 0);
+      const taxa = wsTipo === 'ENTREGA' ? (Number(document.getElementById('ws-fee')?.value) || 0) : 0;
+      updateWsTroco(subtotal + taxa);
+    });
+  }
+
   document.getElementById('ws-cart-items').addEventListener('click', (e) => {
     const btn = e.target.closest('.qty-btn');
     if (!btn) return;
@@ -266,7 +306,6 @@ function bindWhatsAppEvents() {
     renderWsCarrinho();
   });
 
-  // Confirmar
   document.getElementById('ws-confirm-btn').addEventListener('click', confirmarWhatsApp);
 }
 
@@ -345,7 +384,6 @@ function abrirModalDadosCliente() {
       document.getElementById('ws-fee').value = document.getElementById('mdl-taxa').value || 8;
     }
 
-    // Atualiza o resumo no botão
     const resumo = isEntrega
       ? `${nome} · ${document.getElementById('ws-address').value || 'sem endereço'}`
       : nome;
@@ -357,7 +395,7 @@ function abrirModalDadosCliente() {
 }
 
 // ============================================================
-// CONFIRMAR PEDIDO WHATSAPP
+// CONFIRMAR PEDIDO WHATSAPP — DEC-02 + DEC-03
 // ============================================================
 async function confirmarWhatsApp() {
   const btn = document.getElementById('ws-confirm-btn');
@@ -373,6 +411,9 @@ async function confirmarWhatsApp() {
       return;
     }
 
+    // DEC-02: captura observação
+    const observation = document.getElementById('ws-observation').value.trim() || null;
+
     const payload = {
       channel: 'WHATSAPP',
       items: wsCarrinho.map(i => ({
@@ -381,7 +422,8 @@ async function confirmarWhatsApp() {
       })),
       customer_name: name,
       customer_phone: document.getElementById('ws-phone').value.trim() || null,
-      delivery_fee: wsTipo === 'ENTREGA' ? Number(document.getElementById('ws-fee').value) || 0 : 0
+      delivery_fee: wsTipo === 'ENTREGA' ? Number(document.getElementById('ws-fee').value) || 0 : 0,
+      observation
     };
 
     if (wsTipo === 'ENTREGA') {
@@ -392,10 +434,24 @@ async function confirmarWhatsApp() {
 
     const order = await Digao.post('/orders', payload);
 
+    // DEC-03: captura valor recebido se DINHEIRO
+    let received = null;
+    if (wsFormaPgto === 'DINHEIRO') {
+      const recebidoInput = document.getElementById('ws-valor-recebido');
+      received = Number(recebidoInput?.value) || null;
+      if (received && received < order.total) {
+        Digao.toast('Valor recebido insuficiente.', 'error');
+        btn.disabled = false;
+        btn.querySelector('span').textContent = 'Confirmar pedido';
+        return;
+      }
+    }
+
     // Registra pagamento
     await Digao.post(`/orders/${order.id}/payment`, {
       method: wsFormaPgto,
-      amount: order.total
+      amount: order.total,
+      received
     });
 
     Digao.toast(`Pedido #${Digao.pad(order.number)} registrado!`, 'success');
@@ -408,6 +464,7 @@ async function confirmarWhatsApp() {
     document.getElementById('ws-neighborhood').value = '';
     document.getElementById('ws-complement').value = '';
     document.getElementById('ws-fee').value = '8.00';
+    document.getElementById('ws-observation').value = '';
     document.getElementById('ws-dados-label').textContent = 'Preencher dados de entrega';
     renderWsCarrinho();
 

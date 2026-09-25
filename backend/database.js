@@ -314,7 +314,10 @@ const migrations = [
   ['orders',   'waiter_id', 'ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)'],
   ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0'],
   ['orders', 'cash_register_id', 'ALTER TABLE orders ADD COLUMN cash_register_id INTEGER REFERENCES cash_registers(id)'],
-  ['order_items', 'is_additional', 'ALTER TABLE order_items ADD COLUMN is_additional INTEGER NOT NULL DEFAULT 0']
+  ['order_items', 'is_additional', 'ALTER TABLE order_items ADD COLUMN is_additional INTEGER NOT NULL DEFAULT 0'],
+  // FIX Ciclo 8 / DEC-05: soft delete em expenses/losses
+  ['expenses', 'active', 'ALTER TABLE expenses ADD COLUMN active INTEGER NOT NULL DEFAULT 1'],
+  ['losses',   'active', 'ALTER TABLE losses ADD COLUMN active INTEGER NOT NULL DEFAULT 1']
 ];
 
 migrations.forEach(([table, column, sql]) => {

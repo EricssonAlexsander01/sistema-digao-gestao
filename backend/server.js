@@ -16,6 +16,9 @@
 // + FIX Ciclo 6 / BUG-D: expõe payments (plural) preservando payment (singular)
 // + FIX Ciclo 7 / AUTH: autenticação server-side com sessão + cookie HttpOnly.
 //   Toda rota é protegida por requireAuth/requireRole. Backend é a autoridade.
+// + FIX Ciclo 8 / DEC-05: soft delete em expenses/losses (active)
+// + FIX Ciclo 8 / RISCO-01: limite de 200 itens por pedido
+// + FIX Ciclo 8 / RISCO-02: bloqueia pagamento de CANCELADO/CONCLUIDO
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -34,7 +37,6 @@ app.use(express.json());
 
 app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
-// Identifica req.user a partir do cookie (não bloqueia — só popula)
 app.use(auth.identifyUser);
 
 app.use((req, res, next) => {
@@ -167,7 +169,6 @@ function getPaymentRefundable(paymentId) {
 // AUTENTICAÇÃO
 // ============================================================
 
-// Login — público
 app.post('/api/auth/login', (req, res) => {
   const { username, password } = req.body || {};
 
@@ -177,26 +178,14 @@ app.post('/api/auth/login', (req, res) => {
 
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
 
-  if (!user) {
-    return res.status(401).json({ error: 'Credenciais inválidas' });
-  }
-
-  if (!user.active) {
-    return res.status(401).json({ error: 'Usuário inativo' });
-  }
-
-  if (!user.password_hash) {
-    return res.status(401).json({ error: 'Usuário sem senha definida' });
-  }
-
+  if (!user) return res.status(401).json({ error: 'Credenciais inválidas' });
+  if (!user.active) return res.status(401).json({ error: 'Usuário inativo' });
+  if (!user.password_hash) return res.status(401).json({ error: 'Usuário sem senha definida' });
   if (!auth.verifyPassword(password, user.password_hash)) {
     return res.status(401).json({ error: 'Credenciais inválidas' });
   }
 
-  // Limpa sessões expiradas oportunisticamente
   auth.cleanupExpiredSessions();
-
-  // Cria sessão
   const { token } = auth.createSession(user.id);
   auth.setSessionCookie(res, token);
 
@@ -210,7 +199,6 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-// Logout — autenticado
 app.post('/api/auth/logout', auth.requireAuth, (req, res) => {
   const token = auth.getCookieToken(req);
   if (token) auth.revokeSession(token);
@@ -218,7 +206,6 @@ app.post('/api/auth/logout', auth.requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// Me — autenticado
 app.get('/api/auth/me', auth.requireAuth, (req, res) => {
   res.json({
     user: {
@@ -230,7 +217,6 @@ app.get('/api/auth/me', auth.requireAuth, (req, res) => {
   });
 });
 
-// Alterar a própria senha — autenticado
 app.put('/api/auth/password', auth.requireAuth, (req, res) => {
   const { current_password, new_password } = req.body || {};
 
@@ -251,7 +237,6 @@ app.put('/api/auth/password', auth.requireAuth, (req, res) => {
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
     .run(auth.hashPassword(new_password), user.id);
 
-  // Revoga todas as sessões do usuário (incluindo a atual)
   auth.revokeAllUserSessions(user.id);
   auth.clearSessionCookie(res);
 
@@ -259,7 +244,7 @@ app.put('/api/auth/password', auth.requireAuth, (req, res) => {
 });
 
 // ============================================================
-// ADMINISTRAÇÃO DE USUÁRIOS — somente admin
+// ADMINISTRAÇÃO DE USUÁRIOS
 // ============================================================
 
 app.get('/api/users', auth.requireRole('admin'), (req, res) => {
@@ -310,7 +295,6 @@ app.put('/api/users/:id', auth.requireRole('admin'), (req, res) => {
     return res.status(400).json({ error: 'Role inválida' });
   }
 
-  // Impede que o admin desative a si mesmo
   if (id === req.user.id && active === false) {
     return res.status(400).json({ error: 'Você não pode desativar a própria conta' });
   }
@@ -324,7 +308,6 @@ app.put('/api/users/:id', auth.requireRole('admin'), (req, res) => {
     id
   );
 
-  // Se desativou, revoga todas as sessões do alvo
   if (active === false) {
     auth.revokeAllUserSessions(id);
   }
@@ -346,19 +329,18 @@ app.put('/api/users/:id/password', auth.requireRole('admin'), (req, res) => {
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
     .run(auth.hashPassword(new_password), id);
 
-  // Revoga todas as sessões do alvo
   auth.revokeAllUserSessions(id);
 
   res.json({ ok: true, message: 'Senha redefinida. Sessões do usuário foram encerradas.' });
 });
 
 // ============================================================
-// ROTA RAIZ (pública — health/info)
+// ROTA RAIZ (pública)
 // ============================================================
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.7.0',
+    versao: '1.8.0',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
     modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão', 'Estorno', 'Usuários']
   });
@@ -685,6 +667,9 @@ app.get('/api/orders/:id', auth.requireAuth, (req, res) => {
   res.json(o);
 });
 
+// ============================================================
+// POST /api/orders — Ciclo 2 + Ciclo 8 (limite 200 itens)
+// ============================================================
 app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const {
     channel, items, observation,
@@ -699,6 +684,13 @@ app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) =
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'RN001: Pedido precisa de pelo menos um produto' });
+  }
+
+  // FIX Ciclo 8 / RISCO-01: limite de 200 itens por pedido
+  if (items.length > 200) {
+    return res.status(400).json({
+      error: 'RN038: Pedido excede o limite de 200 itens.'
+    });
   }
 
   if (channel === 'MESA' && !table_id) {
@@ -857,13 +849,29 @@ app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) =
   }
 });
 
+// ============================================================
+// PUT /api/orders/:id — Ciclo 8 (RISCO-02)
+// Bloqueia reversão de CANCELADO e CONCLUIDO
+// ============================================================
 app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'), (req, res) => {
   const { status } = req.body;
   const valid = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'Status inválido' });
 
-  const pedido = db.prepare('SELECT id FROM orders WHERE id = ?').get(req.params.id);
+  const pedido = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado' });
+
+  // FIX Ciclo 8 / RISCO-02: estados finais não podem ser revertidos
+  if (pedido.status === 'CANCELADO' && status !== 'CANCELADO') {
+    return res.status(400).json({
+      error: 'RN039: Pedido cancelado não pode ser reativado.'
+    });
+  }
+  if (pedido.status === 'CONCLUIDO' && status !== 'CONCLUIDO') {
+    return res.status(400).json({
+      error: 'RN040: Pedido concluído não pode ser revertido.'
+    });
+  }
 
   if (status === 'CANCELADO') {
     const total = getOrderNetPaid(req.params.id);
@@ -881,7 +889,7 @@ app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'),
 });
 
 // ============================================================
-// PAYMENTS
+// PAYMENTS — Ciclo 8 (RISCO-02): bloqueia CANCELADO/CONCLUIDO
 // ============================================================
 app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res) => {
   const body = req.body || {};
@@ -899,6 +907,18 @@ app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!order) {
     return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
+
+  // FIX Ciclo 8 / RISCO-02: bloqueia pagamento de estados finais
+  if (order.status === 'CANCELADO') {
+    return res.status(400).json({
+      error: 'RN041: Pedido cancelado não pode receber pagamento.'
+    });
+  }
+  if (order.status === 'CONCLUIDO') {
+    return res.status(400).json({
+      error: 'RN042: Pedido concluído não pode receber novo pagamento.'
+    });
   }
 
   const fsAtual = getOrderFinancialStatus(order.id);
@@ -1576,11 +1596,16 @@ app.get('/api/cash/:id', auth.requireRole('admin','caixa'), (req, res) => {
 
 // ============================================================
 // EXPENSES / LOSSES
+// FIX Ciclo 8 / DEC-05: soft delete (coluna active)
 // ============================================================
 app.get('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
-  const { from, to } = req.query;
+  const { from, to, show_inactive } = req.query;
   let sql = 'SELECT * FROM expenses WHERE 1=1';
   const params = [];
+
+  if (show_inactive !== '1') {
+    sql += ' AND active = 1';
+  }
   if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
   if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
   sql += ' ORDER BY id DESC';
@@ -1597,10 +1622,36 @@ app.post('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
+// FIX Ciclo 8 / DEC-05: soft delete
+app.delete('/api/expenses/:id', auth.requireRole('admin','caixa'), (req, res) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Lançamento não encontrado' });
+  if (existing.active === 0) return res.status(400).json({ error: 'Lançamento já está desativado' });
+
+  db.prepare('UPDATE expenses SET active = 0 WHERE id = ?').run(id);
+  res.json({ ok: true, id, active: 0 });
+});
+
+// FIX Ciclo 8 / DEC-05: reativar
+app.put('/api/expenses/:id/reactivate', auth.requireRole('admin','caixa'), (req, res) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Lançamento não encontrado' });
+  if (existing.active === 1) return res.status(400).json({ error: 'Lançamento já está ativo' });
+
+  db.prepare('UPDATE expenses SET active = 1 WHERE id = ?').run(id);
+  res.json({ ok: true, id, active: 1 });
+});
+
 app.get('/api/losses', auth.requireRole('admin','caixa'), (req, res) => {
-  const { from, to } = req.query;
+  const { from, to, show_inactive } = req.query;
   let sql = 'SELECT * FROM losses WHERE 1=1';
   const params = [];
+
+  if (show_inactive !== '1') {
+    sql += ' AND active = 1';
+  }
   if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
   if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
   sql += ' ORDER BY id DESC';
@@ -1615,6 +1666,28 @@ app.post('/api/losses', auth.requireRole('admin','caixa'), (req, res) => {
   const r = db.prepare('INSERT INTO losses (description, category, amount) VALUES (?,?,?)')
     .run(description, category || null, amount);
   res.json({ id: r.lastInsertRowid });
+});
+
+// FIX Ciclo 8 / DEC-05: soft delete
+app.delete('/api/losses/:id', auth.requireRole('admin','caixa'), (req, res) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM losses WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Lançamento não encontrado' });
+  if (existing.active === 0) return res.status(400).json({ error: 'Lançamento já está desativado' });
+
+  db.prepare('UPDATE losses SET active = 0 WHERE id = ?').run(id);
+  res.json({ ok: true, id, active: 0 });
+});
+
+// FIX Ciclo 8 / DEC-05: reativar
+app.put('/api/losses/:id/reactivate', auth.requireRole('admin','caixa'), (req, res) => {
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT * FROM losses WHERE id = ?').get(id);
+  if (!existing) return res.status(404).json({ error: 'Lançamento não encontrado' });
+  if (existing.active === 1) return res.status(400).json({ error: 'Lançamento já está ativo' });
+
+  db.prepare('UPDATE losses SET active = 1 WHERE id = ?').run(id);
+  res.json({ ok: true, id, active: 1 });
 });
 
 // ============================================================
@@ -1726,7 +1799,7 @@ app.post('/api/drivers/:id/pay', auth.requireRole('admin','caixa'), (req, res) =
 });
 
 // ============================================================
-// DASHBOARD
+// DASHBOARD — FIX Ciclo 8 / DEC-05: só lançamentos ativos
 // ============================================================
 app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
   const now = new Date();
@@ -1745,12 +1818,12 @@ app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
 
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
-    WHERE date(created_at, 'localtime') = date(?)
+    WHERE date(created_at, 'localtime') = date(?) AND active = 1
   `).get(today).t;
 
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
-    WHERE date(created_at, 'localtime') = date(?)
+    WHERE date(created_at, 'localtime') = date(?) AND active = 1
   `).get(today).t;
 
   const entregas = db.prepare(`
@@ -1776,7 +1849,7 @@ app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
 });
 
 // ============================================================
-// RELATÓRIOS
+// RELATÓRIOS — FIX Ciclo 8 / DEC-05: só lançamentos ativos
 // ============================================================
 app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to } = req.query;
@@ -1810,12 +1883,12 @@ app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
 
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
-    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?) AND active = 1
   `).get(fromDate, toDate).t;
 
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
-    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
+    WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?) AND active = 1
   `).get(fromDate, toDate).t;
 
   const deliveries = db.prepare(`
@@ -1887,7 +1960,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.7.0');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.8.0');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');

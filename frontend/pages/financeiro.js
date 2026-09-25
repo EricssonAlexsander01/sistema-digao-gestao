@@ -2,13 +2,16 @@
    DIGÃO GESTÃO — Módulo Financeiro Geral
    Despesas, Perdas e Resultado
    FIX Bug #4: card de destaque = hoje (consistente).
-   Lista tem filtro de período selecionável (padrão: hoje).
+   FIX Ciclo 8 / DEC-04: datalist de categorias já existentes.
+   FIX Ciclo 8 / DEC-05: soft delete + reativação de lançamentos.
    ============================================================ */
 
 let expensesCache = [];
 let lossesCache = [];
-let finAba = 'despesas'; // 'despesas' | 'perdas'
-let finPeriodo = 'hoje'; // 'hoje' | 'ontem' | '7d' | '30d' | 'mes' | 'todos'
+let finAba = 'despesas';
+let finPeriodo = 'hoje';
+let finMostrarInativos = false;
+let finCategoriasSugeridas = []; // DEC-04
 
 // ============================================================
 // LOADER
@@ -23,7 +26,6 @@ window.loadFinanceiro = async function (container) {
 
 // ============================================================
 // HELPERS DE PERÍODO
-// Retorna { from, to } (strings YYYY-MM-DD) ou { from: null, to: null } para "todos"
 // ============================================================
 function getPeriodoRange(periodo) {
   if (periodo === 'todos') return { from: null, to: null };
@@ -72,19 +74,26 @@ function getPeriodoRange(periodo) {
 }
 
 // ============================================================
-// RECARREGAR DADOS (respeitando filtro)
+// RECARREGAR DADOS
 // ============================================================
 async function recarregarDados() {
   const { from, to } = getPeriodoRange(finPeriodo);
   const qs = [];
   if (from) qs.push(`from=${from}`);
   if (to)   qs.push(`to=${to}`);
+  if (finMostrarInativos) qs.push('show_inactive=1');
   const query = qs.length ? '?' + qs.join('&') : '';
 
   [expensesCache, lossesCache] = await Promise.all([
     Digao.get('/expenses' + query),
     Digao.get('/losses' + query)
   ]);
+
+  // DEC-04: coleta categorias únicas (ativas + inativas) para o datalist
+  const todasCategorias = [...expensesCache, ...lossesCache]
+    .map(x => x.category)
+    .filter(Boolean);
+  finCategoriasSugeridas = [...new Set(todasCategorias)].sort();
 }
 
 // ============================================================
@@ -106,6 +115,10 @@ function renderFinanceiroLayout() {
           </div>
 
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);cursor:pointer">
+              <input type="checkbox" id="fin-show-inactive"> Mostrar desativados
+            </label>
+
             <select class="select" id="fin-filtro-periodo" style="padding:6px 10px;font-size:12px">
               <option value="hoje">Hoje</option>
               <option value="ontem">Ontem</option>
@@ -126,15 +139,13 @@ function renderFinanceiroLayout() {
 }
 
 // ============================================================
-// RESUMO (Card de destaque = HOJE)
+// RESUMO
 // ============================================================
 async function renderResumo() {
   const dash = await Digao.get('/dashboard');
   const el = document.getElementById('fin-resumo');
   if (!el) return;
 
-  // Todos os valores do card vêm do /dashboard, que já filtra por HOJE.
-  // Assim, os 4 KPIs falam do MESMO escopo.
   const totalDespesas = dash.despesas || 0;
   const totalPerdas = dash.perdas || 0;
   const resultado = dash.resultado || 0;
@@ -162,7 +173,7 @@ async function renderResumo() {
 }
 
 // ============================================================
-// LISTA (abas + filtro de período)
+// LISTA
 // ============================================================
 function renderLista() {
   const el = document.getElementById('fin-list');
@@ -171,11 +182,15 @@ function renderLista() {
   const icon = finAba === 'despesas' ? 'fa-arrow-up' : 'fa-triangle-exclamation';
   const color = finAba === 'despesas' ? 'var(--danger)' : 'var(--warning)';
 
-  // Atualiza visual do select
   const sel = document.getElementById('fin-filtro-periodo');
   if (sel) sel.value = finPeriodo;
 
-  const total = data.reduce((s, d) => s + d.amount, 0);
+  const chk = document.getElementById('fin-show-inactive');
+  if (chk) chk.checked = finMostrarInativos;
+
+  // Soma só ativos
+  const total = data.filter(d => d.active !== 0).reduce((s, d) => s + d.amount, 0);
+
   const labelPeriodo = {
     hoje: 'hoje',
     ontem: 'ontem',
@@ -204,31 +219,91 @@ function renderLista() {
         Total: <strong style="color:${color}">− ${Digao.money(total)}</strong>
       </span>
     </div>
-    ${data.map(item => `
-      <div style="display:grid;grid-template-columns:42px 1fr auto;gap:14px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border)">
-        <div style="width:36px;height:36px;background:var(--bg-dark);border-radius:50%;display:flex;align-items:center;justify-content:center;color:${color};font-size:13px">
-          <i class="fa-solid ${icon}"></i>
-        </div>
-        <div style="min-width:0">
-          <div style="font-size:13.5px;font-weight:600">${escapeHtml(item.description)}</div>
-          <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px">
-            ${item.category ? `<span class="badge badge-info" style="margin-right:6px">${escapeHtml(item.category)}</span>` : ''}
-            ${Digao.date(item.created_at)}
-          </div>
-        </div>
-        <div style="text-align:right;font-weight:700;color:${color};font-size:14px">
-          − ${Digao.money(item.amount)}
+    ${data.map(item => renderLancamento(item, icon, color)).join('')}
+  `;
+
+  // Bind botões de desativar/reativar
+  el.querySelectorAll('[data-action="toggle"]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = Number(btn.dataset.id);
+      const isActive = btn.dataset.active === '1';
+      await toggleLancamento(id, isActive);
+    });
+  });
+}
+
+function renderLancamento(item, icon, color) {
+  const isActive = item.active !== 0;
+  const opacidade = isActive ? '1' : '0.55';
+  const bg = isActive ? '' : 'background:rgba(0,0,0,0.15);';
+
+  return `
+    <div style="display:grid;grid-template-columns:42px 1fr auto auto;gap:14px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--border);opacity:${opacidade};${bg}">
+      <div style="width:36px;height:36px;background:var(--bg-dark);border-radius:50%;display:flex;align-items:center;justify-content:center;color:${color};font-size:13px">
+        <i class="fa-solid ${icon}"></i>
+      </div>
+      <div style="min-width:0">
+        <div style="font-size:13.5px;font-weight:600;${!isActive ? 'text-decoration:line-through;' : ''}">${escapeHtml(item.description)}</div>
+        <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px">
+          ${item.category ? `<span class="badge badge-info" style="margin-right:6px">${escapeHtml(item.category)}</span>` : ''}
+          ${Digao.date(item.created_at)}
+          ${!isActive ? ' · <span style="color:var(--warning);font-weight:600">DESATIVADO</span>' : ''}
         </div>
       </div>
-    `).join('')}
+      <div style="text-align:right;font-weight:700;color:${color};font-size:14px;${!isActive ? 'text-decoration:line-through;' : ''}">
+        − ${Digao.money(item.amount)}
+      </div>
+      <button
+        class="icon-btn"
+        data-action="toggle"
+        data-id="${item.id}"
+        data-active="${isActive ? 1 : 0}"
+        title="${isActive ? 'Desativar' : 'Reativar'}"
+      >
+        <i class="fa-solid ${isActive ? 'fa-eye-slash' : 'fa-eye'}"></i>
+      </button>
+    </div>
   `;
+}
+
+// ============================================================
+// DESATIVAR / REATIVAR (DEC-05)
+// ============================================================
+async function toggleLancamento(id, isActive) {
+  const endpoint = finAba === 'despesas' ? '/expenses' : '/losses';
+
+  if (isActive) {
+    // Desativar
+    if (!confirm('Desativar este lançamento?\n\nEle continuará no banco, mas deixará de contar nos relatórios e no dashboard até ser reativado.')) {
+      return;
+    }
+    try {
+      await Digao.del(`${endpoint}/${id}`);
+      Digao.toast('Lançamento desativado', 'warning');
+      await recarregarDados();
+      renderLista();
+      await renderResumo();
+    } catch (e) { /* já tratado */ }
+  } else {
+    // Reativar
+    if (!confirm('Reativar este lançamento?\n\nEle voltará a contar nos relatórios e no dashboard.')) {
+      return;
+    }
+    try {
+      await Digao.put(`${endpoint}/${id}/reactivate`);
+      Digao.toast('Lançamento reativado', 'success');
+      await recarregarDados();
+      renderLista();
+      await renderResumo();
+    } catch (e) { /* já tratado */ }
+  }
 }
 
 // ============================================================
 // EVENTOS
 // ============================================================
 function bindFinanceiroEvents() {
-  // Abas
   document.querySelectorAll('[data-aba]').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('[data-aba]').forEach(b => b.classList.remove('active'));
@@ -238,7 +313,6 @@ function bindFinanceiroEvents() {
     });
   });
 
-  // Filtro de período
   const filtro = document.getElementById('fin-filtro-periodo');
   if (filtro) {
     filtro.value = finPeriodo;
@@ -249,15 +323,30 @@ function bindFinanceiroEvents() {
     });
   }
 
-  // Novo lançamento
+  const chkInativos = document.getElementById('fin-show-inactive');
+  if (chkInativos) {
+    chkInativos.checked = finMostrarInativos;
+    chkInativos.addEventListener('change', async (e) => {
+      finMostrarInativos = e.target.checked;
+      await recarregarDados();
+      renderLista();
+    });
+  }
+
   const btnNovo = document.getElementById('btn-novo-lancamento');
   if (btnNovo) btnNovo.addEventListener('click', abrirModalLancamento);
 }
 
 // ============================================================
-// MODAL — NOVO LANÇAMENTO
+// MODAL — NOVO LANÇAMENTO (com datalist DEC-04)
 // ============================================================
 function abrirModalLancamento() {
+  const datalistHtml = finCategoriasSugeridas.length > 0
+    ? `<datalist id="categorias-sugeridas">
+        ${finCategoriasSugeridas.map(c => `<option value="${escapeHtml(c)}">`).join('')}
+       </datalist>`
+    : '';
+
   const html = `
     <h3>Novo lançamento</h3>
 
@@ -275,7 +364,14 @@ function abrirModalLancamento() {
       </div>
       <div>
         <label class="label">Categoria (opcional)</label>
-        <input class="input" id="lanc-cat" placeholder="Ex: Insumos, Estoque, Quebra...">
+        <input
+          class="input"
+          id="lanc-cat"
+          placeholder="Ex: Insumos, Estoque, Quebra..."
+          list="categorias-sugeridas"
+          autocomplete="off"
+        >
+        ${datalistHtml}
       </div>
       <div>
         <label class="label">Valor (R$)</label>
@@ -310,7 +406,6 @@ function abrirModalLancamento() {
     Digao.toast(`${tipo === 'despesas' ? 'Despesa' : 'Perda'} lançada`, 'success');
     m.close();
 
-    // Recarrega respeitando o filtro atual
     await recarregarDados();
     renderLista();
     await renderResumo();
