@@ -55,6 +55,11 @@ window.loadPDV = async function (container, params = {}) {
       abrirModalPagamentoMesa(mesaCtx.open_order);
     }
   }
+
+  // FIX Bug #2b — atualiza o botão "Enviar para cozinha" após carregar
+  if (mesaCtx) {
+    await atualizarBotaoEnviarCozinha();
+  }
 };
 
 // ============================================================
@@ -95,6 +100,72 @@ function carregarItensDoPedidoAberto(order) {
   }));
 }
 
+// FIX Bug #2b — atualiza o estado visual do botão "Enviar para cozinha"
+async function atualizarBotaoEnviarCozinha() {
+  const btn = document.getElementById('btn-enviar-cozinha');
+  if (!btn) return;
+
+  if (!mesaCtx || !mesaCtx.open_order) {
+    btn.disabled = true;
+    btn.className = 'btn btn-secondary';
+    btn.innerHTML = '<i class="fa-solid fa-fire"></i> Enviar para cozinha';
+    return;
+  }
+
+  try {
+    const order = await Digao.get(`/orders/${mesaCtx.open_order.id}`);
+    const pendentes = (order.items || []).filter(i => i.print_status === 0).length;
+
+    if (pendentes === 0) {
+      btn.disabled = true;
+      btn.className = 'btn btn-secondary';
+      btn.innerHTML = '<i class="fa-solid fa-check"></i> Enviado para cozinha';
+    } else {
+      btn.disabled = false;
+      btn.className = 'btn btn-primary';
+      btn.innerHTML = `<i class="fa-solid fa-fire"></i> Enviar para cozinha (${pendentes})`;
+    }
+  } catch (e) {
+    console.error('[pdv] erro ao verificar pendentes:', e);
+  }
+}
+
+// FIX Bug #2b — envia itens pendentes para a cozinha
+async function enviarParaCozinha() {
+  if (!mesaCtx || !mesaCtx.open_order) return;
+
+  const btn = document.getElementById('btn-enviar-cozinha');
+  if (!btn) return;
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Enviando…';
+
+  try {
+    const res = await Digao.post(`/orders/${mesaCtx.open_order.id}/send-to-kitchen`, {});
+
+    if (res.ok && res.itensEnviados > 0) {
+      Digao.toast(
+        `${res.itensEnviados} ${res.itensEnviados === 1 ? 'item enviado' : 'itens enviados'} para a cozinha`,
+        'success',
+        2500
+      );
+    } else if (res.ok && res.itensEnviados === 0) {
+      Digao.toast('Nenhum item pendente', 'info', 1500);
+    } else {
+      Digao.toast(`Falha ao enviar: ${res.error || 'desconhecido'}`, 'error', 4000);
+    }
+  } catch (e) {
+    console.error('[pdv] erro ao enviar para cozinha:', e);
+  } finally {
+    await carregarContextoMesa(mesaCtx.table_id);
+    if (mesaCtx.open_order) {
+      carregarItensDoPedidoAberto(mesaCtx.open_order);
+    }
+    renderCarrinho();
+    await atualizarBotaoEnviarCozinha();
+  }
+}
+
 // ============================================================
 // RENDER — estrutura da tela
 // FIX Bug #8 — todo o HTML é envolvido em #pdv-root.
@@ -116,6 +187,9 @@ function renderPDV() {
       </div>
       <div style="display:flex;gap:8px">
         ${mesaCtx.open_order ? `
+          <button class="btn btn-primary" id="btn-enviar-cozinha">
+            <i class="fa-solid fa-fire"></i> Enviar para cozinha
+          </button>
           <button class="btn btn-success" id="btn-fechar-conta">
             <i class="fa-solid fa-money-bill"></i> Fechar conta (${Digao.money(mesaCtx.open_order.total)})
           </button>
@@ -400,6 +474,9 @@ function bindPDVEvents() {
     }
   });
 
+  // FIX Bug #2b — botão "Enviar para cozinha"
+  root.querySelector('#btn-enviar-cozinha')?.addEventListener('click', enviarParaCozinha);
+
   // ===== Adicionar produto (delegado em #pdv-root) =====
   root.addEventListener('click', (e) => {
     const card = e.target.closest('.product-card');
@@ -550,6 +627,9 @@ async function confirmarVenda() {
 
       const obsField = document.getElementById('order-observation');
       if (obsField) obsField.value = '';
+
+      // FIX Bug #2b — novos itens fazem o botão voltar a ficar habilitado
+      await atualizarBotaoEnviarCozinha();
 
       return;
     }

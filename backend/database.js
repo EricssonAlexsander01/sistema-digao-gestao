@@ -1,5 +1,6 @@
 // database.js — Estrutura completa do banco (Seção 22 do documento)
 // + Módulo de MESAS e GARÇONS
+// + FIX Bug #2b: print_status em order_items (envio para cozinha, só MESA)
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -95,6 +96,8 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 -- ORDER_ITEMS (Seção 5.2 — Informações da venda)
+-- FIX Bug #2b: print_status controla envio para cozinha (só MESA)
+--   0 = PENDENTE, 1 = ENVIADO
 CREATE TABLE IF NOT EXISTS order_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -102,7 +105,9 @@ CREATE TABLE IF NOT EXISTS order_items (
   name TEXT NOT NULL,
   price REAL NOT NULL,
   quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity > 0),
-  observation TEXT
+  observation TEXT,
+  print_status INTEGER NOT NULL DEFAULT 0
+    CHECK(print_status IN (0, 1))
 );
 
 -- PAYMENTS (Seção 9 — Pagamentos)
@@ -209,7 +214,9 @@ function columnExists(table, column) {
 const migrations = [
   ['products', 'barcode',   'ALTER TABLE products ADD COLUMN barcode TEXT'],
   ['orders',   'table_id',  'ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES tables(id)'],
-  ['orders',   'waiter_id', 'ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)']
+  ['orders',   'waiter_id', 'ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)'],
+  // FIX Bug #2b: estado de envio para cozinha (só MESA)
+  ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0']
 ];
 
 migrations.forEach(([table, column, sql]) => {
@@ -222,6 +229,16 @@ migrations.forEach(([table, column, sql]) => {
     }
   }
 });
+
+// FIX Bug #2b — índice criado DEPOIS das migrations (coluna já existe)
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_order_items_print_status
+      ON order_items(order_id, print_status)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_order_items_print_status: ${e.message}`);
+}
 
 // ============================================================
 // VERIFICA SE O CHECK DO channel PERMITE 'MESA'

@@ -64,6 +64,15 @@ function recalcularTotaisPedido(orderId) {
   return { subtotal, delivery_fee: fee, total };
 }
 
+// FIX Bug #2b — busca itens pendentes de envio para cozinha (só MESA)
+function getPendingItems(orderId) {
+  return db.prepare(`
+    SELECT * FROM order_items
+    WHERE order_id = ? AND print_status = 0
+    ORDER BY id ASC
+  `).all(orderId);
+}
+
 // ============================================================
 // ROTA RAIZ
 // ============================================================
@@ -354,8 +363,8 @@ app.post('/api/orders', (req, res) => {
 
     if (pedidoExistente) {
       const insertItem = db.prepare(`
-        INSERT INTO order_items (order_id, product_id, name, price, quantity, observation)
-        VALUES (?,?,?,?,?,?)
+        INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
+        VALUES (?,?,?,?,?,?,0)
       `);
 
       const adicionar = db.transaction(() => {
@@ -417,8 +426,8 @@ app.post('/api/orders', (req, res) => {
 
   const orderId = result.lastInsertRowid;
   const insertItem = db.prepare(`
-    INSERT INTO order_items (order_id, product_id, name, price, quantity, observation)
-    VALUES (?,?,?,?,?,?)
+    INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
+    VALUES (?,?,?,?,?,?,0)
   `);
   items.forEach(it => {
     insertItem.run(orderId, it.product_id || null, it.name, it.price, it.quantity, it.observation || null);
@@ -501,16 +510,40 @@ app.post('/api/orders/:id/payment', (req, res) => {
     }
   }
 
+  // ============================================================
+  // FIX Bug #2 — Impressão automática no pagamento
+  // FIX Bug #2b — Para MESA, só imprime itens PENDENTES (fallback).
+  //              Para outros canais, mantém o comportamento anterior.
+  // ============================================================
   const mesaPgto = order.table_id
     ? db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id)
     : null;
   const garcomPgto = order.waiter_id
     ? db.prepare('SELECT * FROM waiters WHERE id = ?').get(order.waiter_id)
     : null;
-  const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
 
-  printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
-    .catch(e => console.error('[payment] erro ao imprimir:', e));
+  if (order.channel === 'MESA') {
+    // Fallback: só imprime itens que ainda não foram enviados à cozinha
+    const pendentes = getPendingItems(order.id);
+    if (pendentes.length > 0) {
+      printer.imprimirComanda(order, pendentes, mesaPgto, garcomPgto)
+        .then(result => {
+          if (result.ok) {
+            const ids = pendentes.map(i => i.id);
+            const ph = ids.map(() => '?').join(',');
+            db.prepare(`
+              UPDATE order_items SET print_status = 1 WHERE id IN (${ph})
+            `).run(...ids);
+          }
+        })
+        .catch(e => console.error('[payment] erro ao imprimir fallback:', e));
+    }
+  } else {
+    // BALCAO / WHATSAPP / IFOOD — comportamento inalterado
+    const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+    printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
+      .catch(e => console.error('[payment] erro ao imprimir:', e));
+  }
 
   const register = getOpenCashRegister();
   if (register) {
@@ -528,6 +561,78 @@ app.post('/api/orders/:id/payment', (req, res) => {
   }
 
   res.json({ ok: true, change, method, financial_status: 'PAGO' });
+});
+
+// ============================================================
+// FIX Bug #2b — ENVIAR PARA COZINHA (só MESA)
+// Imprime itens PENDENTES e marca como ENVIADO após sucesso.
+//
+// LIMITAÇÃO DOCUMENTADA:
+//   A impressão física é "at-least-once". Se dois requests chegarem
+//   simultaneamente, ambos podem ver os mesmos itens como PENDENTES
+//   e imprimir duplicado. O sistema NÃO promete exactly-once.
+//   A conferência visual na cozinha resolve o caso excepcional.
+// ============================================================
+app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
+  const orderId = Number(req.params.id);
+
+  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  if (!order) {
+    return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
+
+  if (order.channel !== 'MESA') {
+    return res.status(400).json({
+      error: 'Apenas pedidos de mesa usam send-to-kitchen'
+    });
+  }
+
+  const pendentes = getPendingItems(orderId);
+
+  if (pendentes.length === 0) {
+    return res.json({
+      ok: true,
+      itensEnviados: 0,
+      order_id: order.id,
+      order_number: order.number,
+      message: 'Nenhum item pendente'
+    });
+  }
+
+  const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
+  const garcom = order.waiter_id
+    ? db.prepare('SELECT * FROM waiters WHERE id = ?').get(order.waiter_id)
+    : null;
+
+  // Impressão fora de qualquer transação
+  let resultado;
+  try {
+    resultado = await printer.imprimirComanda(order, pendentes, mesa, garcom);
+  } catch (e) {
+    resultado = { ok: false, error: e.message };
+  }
+
+  if (!resultado.ok) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Falha ao imprimir: ' + (resultado.error || 'desconhecido'),
+      itensReservados: pendentes.length
+    });
+  }
+
+  // Só marca como ENVIADO após confirmação da impressão
+  const ids = pendentes.map(i => i.id);
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`
+    UPDATE order_items SET print_status = 1 WHERE id IN (${placeholders})
+  `).run(...ids);
+
+  res.json({
+    ok: true,
+    itensEnviados: pendentes.length,
+    order_id: order.id,
+    order_number: order.number
+  });
 });
 
 // ============================================================
