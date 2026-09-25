@@ -3,6 +3,10 @@
    FIX Bug #1: 1 mesa = 1 pedido ativo.
    FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render).
    FIX Ciclo 1 Etapa 7: exibir saldo restante em modo MESA (parcial).
+   FIX Ciclo 3 / AUD-ME-07: separação entre itens já existentes no
+     pedido do servidor (is_existing: true) e itens adicionados na
+     sessão atual (is_existing: false). No modo MESA com pedido já
+     aberto, somente os itens novos são enviados ao backend.
    ============================================================ */
 
 let produtosCache = [];
@@ -89,13 +93,17 @@ async function carregarContextoMesa(tableId) {
   }
 }
 
+// FIX Ciclo 3 / AUD-ME-07: itens vindos do servidor são marcados
+// com is_existing: true, para que possam ser distinguidos dos itens
+// adicionados na sessão atual (is_existing: false).
 function carregarItensDoPedidoAberto(order) {
   Digao.state.cart = order.items.map(it => ({
     product_id: it.product_id,
     name: it.name,
     price: it.price,
     quantity: it.quantity,
-    observation: it.observation || ''
+    observation: it.observation || '',
+    is_existing: true
   }));
 }
 
@@ -423,23 +431,40 @@ function renderCarrinho() {
 
 // ============================================================
 // AÇÕES
+// FIX Ciclo 3 / AUD-ME-07: separação entre itens já existentes no
+// servidor (is_existing: true) e novos itens da sessão (false).
+//
+// Regras:
+//  - item já existente no servidor NUNCA é alterado; ao tocar no
+//    produto de novo, cria-se uma NOVA linha com is_existing: false;
+//  - itens novos da sessão (is_existing: false) somam quantidade
+//    entre si quando o mesmo produto é adicionado várias vezes;
+//  - itens com observação sempre entram como linha separada.
 // ============================================================
 function adicionarItem(produtoId) {
   const prod = produtosCache.find(p => p.id === Number(produtoId));
   if (!prod) return;
 
   const cart = Digao.state.cart;
-  const existente = cart.find(i => i.product_id === prod.id && !i.observation);
 
-  if (existente) {
-    existente.quantity++;
+  // Procura SOMENTE em itens novos da sessão (is_existing === false)
+  // com o mesmo product_id e sem observação — só esses podem somar.
+  const novoExistente = cart.find(i =>
+    i.is_existing === false &&
+    i.product_id === prod.id &&
+    !i.observation
+  );
+
+  if (novoExistente) {
+    novoExistente.quantity++;
   } else {
     cart.push({
       product_id: prod.id,
       name: prod.name,
       price: prod.price,
       quantity: 1,
-      observation: ''
+      observation: '',
+      is_existing: false
     });
   }
   renderCarrinho();
@@ -560,10 +585,26 @@ function bindPDVEvents() {
 
 // ============================================================
 // CONFIRMAR VENDA
+// FIX Ciclo 3 / AUD-ME-07: no fluxo MESA com pedido existente,
+// envia SOMENTE os itens novos da sessão (is_existing === false).
+// Se nenhum item novo foi adicionado, apenas recarrega e avisa.
+// Nos fluxos BALCÃO/WHATSAPP o carrinho começa vazio e todos os
+// itens são is_existing === false, então o comportamento é o mesmo.
 // ============================================================
 async function confirmarVenda() {
   const cart = Digao.state.cart;
   if (cart.length === 0) return;
+
+  // No fluxo MESA, precisamos garantir que existam itens novos.
+  const isMesa = !!mesaCtx;
+  const itensParaEnviar = isMesa
+    ? cart.filter(i => i.is_existing === false)
+    : cart;
+
+  if (isMesa && itensParaEnviar.length === 0) {
+    Digao.toast('Nenhum item novo para adicionar à comanda.', 'warning', 2500);
+    return;
+  }
 
   const btn = document.getElementById('confirm-btn');
   if (!btn) return;
@@ -572,22 +613,22 @@ async function confirmarVenda() {
 
   try {
     const payload = {
-      channel: mesaCtx ? 'MESA' : Digao.state.channel,
-      items: cart.map(i => ({
+      channel: isMesa ? 'MESA' : Digao.state.channel,
+      items: itensParaEnviar.map(i => ({
         product_id: i.product_id,
         quantity: i.quantity,
         observation: i.observation || null
       })),
       observation: document.getElementById('order-observation')?.value.trim() || null,
-      delivery_fee: (!mesaCtx && Digao.state.channel === 'WHATSAPP') ? Digao.state.deliveryFee : 0
+      delivery_fee: (!isMesa && Digao.state.channel === 'WHATSAPP') ? Digao.state.deliveryFee : 0
     };
 
-    if (mesaCtx) {
+    if (isMesa) {
       payload.table_id = mesaCtx.table_id;
       payload.waiter_id = mesaCtx.waiter_id;
     }
 
-    if (!mesaCtx && Digao.state.channel === 'WHATSAPP') {
+    if (!isMesa && Digao.state.channel === 'WHATSAPP') {
       payload.customer_name = document.getElementById('cust-name').value.trim() || null;
       payload.customer_phone = document.getElementById('cust-phone').value.trim() || null;
       payload.customer_address = document.getElementById('cust-address').value.trim() || null;
@@ -598,7 +639,7 @@ async function confirmarVenda() {
     const order = await Digao.post('/orders', payload);
 
     // ===== FLUXO MESA =====
-    if (mesaCtx) {
+    if (isMesa) {
       const msg = order.jaExistia
         ? `${mesaCtx.table_name}: +${order.itensAdicionados} ${order.itensAdicionados === 1 ? 'item' : 'itens'} na comanda #${Digao.pad(order.number)}`
         : `${mesaCtx.table_name}: comanda #${Digao.pad(order.number)} aberta`;
@@ -647,7 +688,7 @@ async function confirmarVenda() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.querySelector('span').textContent = mesaCtx
+      btn.querySelector('span').textContent = isMesa
         ? 'Adicionar à comanda'
         : 'Confirmar & Gerar Comanda';
     }
