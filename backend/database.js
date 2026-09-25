@@ -244,7 +244,10 @@ const migrations = [
   // FIX Bug #2b: estado de envio para cozinha (só MESA)
   ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0'],
   // FIX Ciclo 1 (AM3-B): associação pedido ↔ caixa
-  ['orders', 'cash_register_id', 'ALTER TABLE orders ADD COLUMN cash_register_id INTEGER REFERENCES cash_registers(id)']
+  ['orders', 'cash_register_id', 'ALTER TABLE orders ADD COLUMN cash_register_id INTEGER REFERENCES cash_registers(id)'],
+  // FIX Ciclo 5 / AUD-ARQ-01: persistir natureza do item (produto vs adicional).
+  // Itens antigos ficam com DEFAULT 0 automaticamente.
+  ['order_items', 'is_additional', 'ALTER TABLE order_items ADD COLUMN is_additional INTEGER NOT NULL DEFAULT 0']
 ];
 
 migrations.forEach(([table, column, sql]) => {

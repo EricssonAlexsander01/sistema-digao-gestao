@@ -4,6 +4,8 @@
    FIX Bug #7: substituído require('printer') por
    require('@tbalegas/node-printer') — fork mantido, com
    prebuild para Windows x64 + Node 22, validado em teste isolado.
+   FIX Ciclo 5 / AUD-ARQ-01: comanda impressa marca adicionais
+   com prefixo '+ '.
    ============================================================ */
 
 require('dotenv').config();
@@ -78,11 +80,13 @@ async function imprimirComanda(order, items, mesa = null, garcom = null) {
     printer.drawLine();
 
     items.forEach(it => {
-      printer.println(`${it.quantity}x ${it.name}`);
+      // FIX Ciclo 5 / AUD-ARQ-01: adicionais marcados com prefixo '+'
+      const prefixo = it.is_additional ? '+ ' : '  ';
+      printer.println(`${prefixo}${it.quantity}x ${it.name}`);
       printer.alignRight();
       printer.println(`R$ ${(it.price * it.quantity).toFixed(2)}`);
       printer.alignLeft();
-      if (it.observation) printer.println(`   Obs: ${it.observation}`);
+      if (it.observation) printer.println(`     Obs: ${it.observation}`);
     });
 
     printer.drawLine();

@@ -4,6 +4,8 @@
    eliminando o listener global em document que reagia a [data-action]
    de outras telas (ex: .qty-btn do PDV/WhatsApp) e disparava
    PUT /orders/undefined.
+   FIX Ciclo 5 / AUD-ARQ-01: card de comanda marca adicionais
+   com prefixo '+' e destaque visual (info).
    ============================================================ */
 
 let cozinhaTimer = null;
@@ -147,6 +149,8 @@ async function carregarCozinha() {
 
 // ============================================================
 // RENDER — comanda individual
+// FIX Ciclo 5 / AUD-ARQ-01: adicionais marcados com '+ ' e
+// destaque visual em azul (info).
 // ============================================================
 function renderComanda(p) {
   const isNovo = p.status === 'NOVO';
@@ -169,8 +173,8 @@ function renderComanda(p) {
         ${p.items.map(i => `
           <div style="padding:6px 0;border-bottom:1px dashed var(--border)">
             <div style="display:flex;justify-content:space-between;align-items:center">
-              <strong style="font-size:14px;color:var(--primary)">${i.quantity}x</strong>
-              <span style="font-size:13.5px;font-weight:600;flex:1;margin-left:10px">${escapeHtml(i.name)}</span>
+              <strong style="font-size:14px;${i.is_additional ? 'color:var(--info)' : 'color:var(--primary)'}">${i.is_additional ? '+ ' : ''}${i.quantity}x</strong>
+              <span style="font-size:13.5px;font-weight:600;flex:1;margin-left:10px;${i.is_additional ? 'color:var(--info)' : ''}">${escapeHtml(i.name)}</span>
             </div>
             ${i.observation ? `<div style="font-size:11.5px;color:var(--warning);font-style:italic;margin-top:4px;padding-left:26px">⚠ ${escapeHtml(i.observation)}</div>` : ''}
           </div>

@@ -4,6 +4,8 @@
      (modal próprio) e envio para backend com auditoria.
    FIX Ciclo 4 / AUD-ME-05: troca de garçom em mesa ocupada,
      afetando somente tables.waiter_id.
+   FIX Ciclo 5 / AUD-ARQ-01: modal de gerenciar mesa marca
+     adicionais com prefixo '+' e destaque visual.
    ============================================================ */
 
 let mesasCache = [];
@@ -212,6 +214,7 @@ function abrirModalAbrirMesa(mesa) {
 
 // ============================================================
 // MODAL — GERENCIAR MESA OCUPADA
+// FIX Ciclo 5 / AUD-ARQ-01: marca adicionais com prefixo '+'
 // ============================================================
 function abrirModalGerenciarMesa(mesa) {
   const order = mesa.open_order;
@@ -231,8 +234,8 @@ function abrirModalGerenciarMesa(mesa) {
       <div style="background:var(--bg-dark);border-radius:8px;padding:12px;margin-bottom:14px">
         <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;font-weight:600">ITENS DO PEDIDO #${String(order.number).padStart(3,'0')}</div>
         ${order.items.map(it => `
-          <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0">
-            <span><strong>${it.quantity}x</strong> ${escapeHtml(it.name)}</span>
+          <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;${it.is_additional ? 'color:var(--primary)' : ''}">
+            <span><strong>${it.is_additional ? '+ ' : ''}${it.quantity}x</strong> ${escapeHtml(it.name)}</span>
             <strong style="color:var(--primary)">${Digao.money(it.price * it.quantity)}</strong>
           </div>
         `).join('')}

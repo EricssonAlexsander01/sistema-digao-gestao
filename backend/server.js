@@ -23,6 +23,9 @@
 //   garçom sem alterar orders.waiter_id (histórico preservado).
 // + FIX Ciclo 4 / AUD-ME-06: getActiveOrderByTable nunca retorna pedido
 //   com financial_status = 'PAGO'.
+// + FIX Ciclo 5 / AUD-ARQ-01: order_items persiste is_additional (natureza
+//   do item, vinda de products.is_additional). Comanda em texto e impressa
+//   marcam adicionais com prefixo '+ '.
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -338,7 +341,6 @@ app.post('/api/tables/:id/force-free', (req, res) => {
   const tableId = Number(req.params.id);
   const { reason } = req.body || {};
 
-  // Validação do motivo (obrigatório, mínimo 3 caracteres não-brancos)
   if (!reason || typeof reason !== 'string' || reason.trim().length < 3) {
     return res.status(400).json({
       error: 'RN030: Motivo obrigatório (mínimo 3 caracteres) para liberar a mesa à força.'
@@ -346,7 +348,6 @@ app.post('/api/tables/:id/force-free', (req, res) => {
   }
   const motivoLimpo = reason.trim();
 
-  // Verifica se a mesa existe
   const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(tableId);
   if (!mesa) {
     return res.status(404).json({ error: 'Mesa não encontrada' });
@@ -354,14 +355,12 @@ app.post('/api/tables/:id/force-free', (req, res) => {
 
   try {
     const executar = db.transaction(() => {
-      // 1. Localiza pedido operacional vinculado (se houver)
       const pedidoAtivo = db.prepare(`
         SELECT * FROM orders
         WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
         ORDER BY id ASC LIMIT 1
       `).get(tableId);
 
-      // 2. Desvincula o pedido (preserva histórico, não cancela)
       if (pedidoAtivo) {
         db.prepare(`
           UPDATE orders
@@ -370,14 +369,12 @@ app.post('/api/tables/:id/force-free', (req, res) => {
         `).run(pedidoAtivo.id);
       }
 
-      // 3. Libera a mesa
       db.prepare(`
         UPDATE tables
         SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `).run(tableId);
 
-      // 4. Registra auditoria
       db.prepare(`
         INSERT INTO table_force_free_log (table_id, order_id, reason)
         VALUES (?, ?, ?)
@@ -474,10 +471,10 @@ app.get('/api/orders/:id', (req, res) => {
 });
 
 // ============================================================
-// POST /api/orders — Ciclo 2
+// POST /api/orders — Ciclo 2 + Ciclo 5
 // Backend é a autoridade: valida itens, consulta products no banco
-// e usa name/price/active reais. Payload nunca define nome nem preço.
-// Tudo em transação atômica (inclui nextNum e abertura de mesa).
+// e usa name/price/active/is_additional reais. Payload nunca define
+// nome, preço nem natureza. Tudo em transação atômica.
 // ============================================================
 app.post('/api/orders', (req, res) => {
   const {
@@ -500,7 +497,7 @@ app.post('/api/orders', (req, res) => {
     return res.status(400).json({ error: 'Pedido de mesa precisa de table_id' });
   }
 
-  // ---------- validação + resolução de itens (AUD-PD-01..05 / F-P) ----------
+  // ---------- validação + resolução de itens (AUD-PD-01..05 / F-P + AUD-ARQ-01) ----------
   const itensResolvidos = [];
   for (const it of items) {
     if (!it || typeof it !== 'object') {
@@ -517,7 +514,8 @@ app.post('/api/orders', (req, res) => {
       return res.status(400).json({ error: 'Quantidade inválida no item' });
     }
 
-    const prod = db.prepare('SELECT id, name, price, active FROM products WHERE id = ?').get(productId);
+    // FIX Ciclo 5 / AUD-ARQ-01: precisa incluir is_additional no SELECT
+    const prod = db.prepare('SELECT id, name, price, active, is_additional FROM products WHERE id = ?').get(productId);
     if (!prod) {
       return res.status(400).json({ error: `Produto ${productId} não encontrado` });
     }
@@ -533,7 +531,9 @@ app.post('/api/orders', (req, res) => {
       quantity: qtd,
       observation: (it.observation != null && String(it.observation).trim())
         ? String(it.observation).trim()
-        : null
+        : null,
+      // FIX Ciclo 5 / AUD-ARQ-01: persistir natureza do item
+      is_additional: prod.is_additional ? 1 : 0
     });
   }
 
@@ -564,9 +564,10 @@ app.post('/api/orders', (req, res) => {
         const pedidoExistente = getActiveOrderByTable(table_id);
 
         if (pedidoExistente) {
+          // FIX Ciclo 5 / AUD-ARQ-01: persistir is_additional na adição a MESA
           const insertItem = db.prepare(`
-            INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
-            VALUES (?,?,?,?,?,?,0)
+            INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status, is_additional)
+            VALUES (?,?,?,?,?,?,0,?)
           `);
 
           itensResolvidos.forEach(it => {
@@ -576,7 +577,8 @@ app.post('/api/orders', (req, res) => {
               it.name,
               it.price,
               it.quantity,
-              it.observation
+              it.observation,
+              it.is_additional
             );
           });
 
@@ -619,12 +621,13 @@ app.post('/api/orders', (req, res) => {
       );
 
       const orderId = result.lastInsertRowid;
+      // FIX Ciclo 5 / AUD-ARQ-01: persistir is_additional no fluxo padrão
       const insertItem = db.prepare(`
-        INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
-        VALUES (?,?,?,?,?,?,0)
+        INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status, is_additional)
+        VALUES (?,?,?,?,?,?,0,?)
       `);
       itensResolvidos.forEach(it => {
-        insertItem.run(orderId, it.product_id, it.name, it.price, it.quantity, it.observation);
+        insertItem.run(orderId, it.product_id, it.name, it.price, it.quantity, it.observation, it.is_additional);
       });
 
       return {
@@ -959,9 +962,11 @@ app.get('/api/orders/:id/comanda', (req, res) => {
   txt += `Data: ${o.created_at}\n`;
   txt += `Canal: ${o.channel}\n`;
   txt += '--------------------------------\n';
+  // FIX Ciclo 5 / AUD-ARQ-01: marcar adicionais com prefixo '+'
   items.forEach(it => {
-    txt += `${it.quantity}x ${it.name.padEnd(22)} R$ ${(it.price * it.quantity).toFixed(2)}\n`;
-    if (it.observation) txt += `   Obs: ${it.observation}\n`;
+    const prefixo = it.is_additional ? '+ ' : '  ';
+    txt += `${prefixo}${it.quantity}x ${it.name.padEnd(20)} R$ ${(it.price * it.quantity).toFixed(2)}\n`;
+    if (it.observation) txt += `     Obs: ${it.observation}\n`;
   });
   txt += '--------------------------------\n';
   txt += `Subtotal: R$ ${o.subtotal.toFixed(2)}\n`;
