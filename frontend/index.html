@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍔</text></svg>">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Digão Gestão — Sistema de Gestão</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ================= SIDEBAR (desktop) ================= -->
+<aside class="sidebar">
+  <div class="logo-area">
+    <div class="logo-icon"><i class="fa-solid fa-burger"></i></div>
+    <div class="logo-text">
+      <h1>DIGÃO</h1>
+      <span>BURGER &amp; SHAWARMA</span>
+    </div>
+  </div>
+
+  <nav class="menu">
+    <div class="menu-section">OPERAÇÃO</div>
+    <a class="menu-item" data-page="dashboard"><i class="fa-solid fa-house"></i> Início</a>
+    <a class="menu-item active" data-page="pdv"><i class="fa-solid fa-cash-register"></i> PDV</a>
+    <a class="menu-item" data-page="mesas"><i class="fa-solid fa-chair"></i> Mesas</a>
+    <a class="menu-item" data-page="pedidos"><i class="fa-solid fa-receipt"></i> Pedidos</a>
+    <a class="menu-item" data-page="whatsapp"><i class="fa-brands fa-whatsapp"></i> Pedidos WhatsApp</a>
+    <a class="menu-item" data-page="cozinha"><i class="fa-solid fa-utensils"></i> Cozinha &amp; Comandas</a>
+    <a class="menu-item" data-page="caixa"><i class="fa-solid fa-coins"></i> Controle de Caixa</a>
+    <a class="menu-item" data-page="entregadores"><i class="fa-solid fa-motorcycle"></i> Entregadores</a>
+
+    <div class="menu-section">GESTÃO</div>
+    <a class="menu-item" data-page="produtos"><i class="fa-solid fa-box"></i> Produtos</a>
+    <a class="menu-item" data-page="financeiro"><i class="fa-solid fa-chart-line"></i> Financeiro Geral</a>
+    <a class="menu-item" data-page="relatorios"><i class="fa-solid fa-file-lines"></i> Relatórios</a>
+  </nav>
+
+  <div class="sidebar-footer">
+    <div class="caixa-status">
+      <span class="dot" id="caixa-dot"></span>
+      <span id="caixa-label">Caixa fechado</span>
+    </div>
+    <div class="caixa-valor" id="caixa-valor">R$ 0,00</div>
+
+    <div class="user-profile">
+      <div class="avatar">JS</div>
+      <div class="user-info">
+        <strong>João Silva</strong>
+        <span>Operador Administrativo</span>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- ================= MAIN ================= -->
+<main class="main-content">
+  <header class="top-bar">
+    <div class="page-title">
+      <h2 id="page-title">Painel de Operações</h2>
+      <p id="page-subtitle">Digão Burger &amp; Shawarma — Toledo, PR</p>
+    </div>
+    <div class="top-info">
+      <span id="top-date">—</span>
+      <span id="top-time">—</span>
+      <i class="fa-regular fa-bell"></i>
+    </div>
+  </header>
+
+  <section id="app-view" class="view-container">
+    <!-- Conteúdo carregado dinamicamente pelo roteador -->
+  </section>
+</main>
+
+<!-- ================= MENU MOBILE ================= -->
+<button id="menu-mobile-btn" class="menu-mobile-btn">
+  <i class="fa-solid fa-bars"></i>
+</button>
+
+<div id="menu-mobile-overlay" class="menu-mobile-overlay">
+  <nav class="menu-mobile-nav">
+    <button class="menu-mobile-close" id="menu-mobile-close">
+      <i class="fa-solid fa-xmark"></i>
+    </button>
+
+    <div class="menu-section">OPERAÇÃO</div>
+    <a class="menu-item" data-page="dashboard"><i class="fa-solid fa-house"></i> Início</a>
+    <a class="menu-item" data-page="pdv"><i class="fa-solid fa-cash-register"></i> PDV</a>
+    <a class="menu-item" data-page="mesas"><i class="fa-solid fa-chair"></i> Mesas</a>
+    <a class="menu-item" data-page="pedidos"><i class="fa-solid fa-receipt"></i> Pedidos</a>
+    <a class="menu-item" data-page="whatsapp"><i class="fa-brands fa-whatsapp"></i> WhatsApp</a>
+    <a class="menu-item" data-page="cozinha"><i class="fa-solid fa-utensils"></i> Cozinha</a>
+    <a class="menu-item" data-page="caixa"><i class="fa-solid fa-coins"></i> Caixa</a>
+    <a class="menu-item" data-page="entregadores"><i class="fa-solid fa-motorcycle"></i> Entregadores</a>
+
+    <div class="menu-section">GESTÃO</div>
+    <a class="menu-item" data-page="produtos"><i class="fa-solid fa-box"></i> Produtos</a>
+    <a class="menu-item" data-page="financeiro"><i class="fa-solid fa-chart-line"></i> Financeiro</a>
+    <a class="menu-item" data-page="relatorios"><i class="fa-solid fa-file-lines"></i> Relatórios</a>
+  </nav>
+</div>
+
+<!-- ================= TOAST ================= -->
+<div id="toast" class="toast"></div>
+
+<!-- ================= MODAL ================= -->
+<div id="modal-root"></div>
+
+<script src="app.js"></script>
+<script type="module" src="pages/pdv.js"></script>
+<script type="module" src="pages/mesas.js"></script>
+<script type="module" src="pages/pedidos.js"></script>
+<script type="module" src="pages/whatsapp.js"></script>
+<script type="module" src="pages/cozinha.js"></script>
+<script type="module" src="pages/caixa.js"></script>
+<script type="module" src="pages/produtos.js"></script>
+<script type="module" src="pages/entregadores.js"></script>
+<script type="module" src="pages/financeiro.js"></script>
+<script type="module" src="pages/relatorios.js"></script>
+</body>
+</html>
