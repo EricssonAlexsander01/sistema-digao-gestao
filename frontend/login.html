@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍔</text></svg>">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Entrar — Digão Gestão</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="login-body">
+
+  <div class="login-container">
+    <div class="login-card">
+
+      <div class="login-logo">
+        <div class="logo-icon"><i class="fa-solid fa-burger"></i></div>
+        <div class="logo-text">
+          <h1>DIGÃO</h1>
+          <span>BURGER &amp; SHAWARMA</span>
+        </div>
+      </div>
+
+      <h2 class="login-title">Acessar o sistema</h2>
+      <p class="login-subtitle">Entre com seu usuário e senha</p>
+
+      <form id="login-form" autocomplete="on">
+        <label class="label" for="username">Usuário</label>
+        <input
+          class="input"
+          type="text"
+          id="username"
+          name="username"
+          placeholder="ex: joao"
+          autocomplete="username"
+          autofocus
+          required
+        >
+
+        <label class="label" for="password" style="margin-top:14px">Senha</label>
+        <div class="password-wrap">
+          <input
+            class="input"
+            type="password"
+            id="password"
+            name="password"
+            placeholder="••••••••"
+            autocomplete="current-password"
+            required
+          >
+          <button type="button" class="password-toggle" id="toggle-password" tabindex="-1">
+            <i class="fa-solid fa-eye"></i>
+          </button>
+        </div>
+
+        <div id="login-error" class="login-error"></div>
+
+        <button type="submit" class="btn btn-primary btn-block btn-lg login-btn" id="login-submit">
+          <i class="fa-solid fa-right-to-bracket"></i>
+          <span>Entrar</span>
+        </button>
+      </form>
+
+      <div class="login-footer">
+        Digão Burger &amp; Shawarma — Toledo/PR
+      </div>
+
+    </div>
+  </div>
+
+  <script src="login.js"></script>
+</body>
+</html>

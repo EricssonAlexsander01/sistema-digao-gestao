@@ -2,15 +2,16 @@ const db = require('./database');
 
 console.log('🧹 Zerando dados operacionais...');
 
-// FIX Ciclo 4 / AUD-ME-02: incluir table_force_free_log antes de apagar
-// orders/tables (FK sem ON DELETE CASCADE).
+// FIX Ciclo 4 / AUD-ME-02: incluir table_force_free_log antes de orders/tables.
 // FIX Ciclo 6 / AUD-PG-07: incluir payments_refunds antes de payments.
+// FIX Ciclo 7 / AUTH: incluir sessions (vinculadas a users).
 // Envolvido em transação: se uma etapa falhar, nada é apagado.
 
 const zerar = db.transaction(() => {
-  // 1. Auditoria e estornos primeiro (referenciam orders/payments)
+  // 1. Auditoria, estornos e sessões primeiro (referenciam orders/payments/users)
   db.exec(`DELETE FROM table_force_free_log;`);
   db.exec(`DELETE FROM payments_refunds;`);
+  db.exec(`DELETE FROM sessions;`);
 
   // 2. Dados operacionais
   db.exec(`
@@ -30,6 +31,7 @@ const zerar = db.transaction(() => {
     DELETE FROM sqlite_sequence WHERE name IN (
       'table_force_free_log',
       'payments_refunds',
+      'sessions',
       'orders','order_items','payments','deliveries','driver_payments',
       'cash_registers','cash_movements','expenses','losses'
     );
@@ -49,3 +51,4 @@ zerar();
 
 console.log('✅ Dados operacionais zerados. Cardápio e mesas mantidos.');
 console.log('✅ Todas as 25 mesas estão LIVRES.');
+console.log('ℹ️  Usuários e senhas foram PRESERVADOS.');

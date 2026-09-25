@@ -5,6 +5,7 @@
 // + FIX Ciclo 4 / AUD-ME-02: table_force_free_log (auditoria de force-free)
 // + FIX Ciclo 5 / AUD-ARQ-01: order_items.is_additional (natureza do item)
 // + FIX Ciclo 6 / AUD-PG-07: payments_refunds (estornos) + CHECK ESTORNO em cash_movements
+// + FIX Ciclo 7 / AUTH: sessions (autenticação server-side)
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -228,7 +229,6 @@ try {
 
 // ============================================================
 // TABELA DE ESTORNOS — Ciclo 6 / AUD-PG-07
-// payments permanece imutável; estornos são eventos novos.
 // ============================================================
 db.exec(`
   CREATE TABLE IF NOT EXISTS payments_refunds (
@@ -260,6 +260,47 @@ try {
 }
 
 // ============================================================
+// TABELA DE SESSÕES — Ciclo 7 / AUTH
+// Armazena apenas o SHA-256 do token (nunca o token bruto).
+// ============================================================
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_token_hash
+      ON sessions(token_hash)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_sessions_token_hash: ${e.message}`);
+}
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_user
+      ON sessions(user_id)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_sessions_user: ${e.message}`);
+}
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires
+      ON sessions(expires_at)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_sessions_expires: ${e.message}`);
+}
+
+// ============================================================
 // MIGRAÇÕES — adiciona colunas em bancos antigos
 // ============================================================
 function columnExists(table, column) {
@@ -287,7 +328,7 @@ migrations.forEach(([table, column, sql]) => {
   }
 });
 
-// FIX Bug #2b — índice criado DEPOIS das migrations (coluna já existe)
+// FIX Bug #2b — índice criado DEPOIS das migrations
 try {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_order_items_print_status
@@ -309,8 +350,6 @@ try {
 
 // ============================================================
 // MIGRATION Ciclo 6 / AUD-PG-07: CHECK do cash_movements
-// precisa aceitar 'ESTORNO'. SQLite não permite ALTER direto,
-// então recriamos a tabela.
 // ============================================================
 function cashMovementsAceitaEstorno() {
   try {

@@ -1,5 +1,6 @@
 // seed.js — Popula o banco com o cardápio oficial do documento
 // + Mesas e Garçons (Módulo de Mesas)
+require('dotenv').config();
 const db = require('./database');
 
 console.log('🌱 Populando banco com dados iniciais...');
@@ -100,9 +101,35 @@ popularCardapio();
 
 // ============================================================
 // USUÁRIO ADMINISTRATIVO — SEÇÃO 28
+// FIX Ciclo 7: senha configurável via DIGAO_ADMIN_PASSWORD.
+// Sem a variável, o admin NÃO é criado.
 // ============================================================
-db.prepare(`INSERT INTO users (name, username, role) VALUES (?, ?, ?)`)
-  .run('João Silva', 'joao', 'admin');
+const { hashPassword } = require('./auth');
+const adminPassword = process.env.DIGAO_ADMIN_PASSWORD;
+
+if (!adminPassword) {
+  console.log('');
+  console.log('⚠️  DIGAO_ADMIN_PASSWORD não definido no .env');
+  console.log('   O usuário admin NÃO foi criado.');
+  console.log('   Defina a variável e rode o seed novamente.');
+  console.log('');
+} else if (adminPassword.length < 8) {
+  console.log('');
+  console.log('⚠️  DIGAO_ADMIN_PASSWORD tem menos de 8 caracteres.');
+  console.log('   O usuário admin NÃO foi criado.');
+  console.log('');
+} else {
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get('joao');
+  if (existing) {
+    db.prepare('UPDATE users SET password_hash = ?, active = 1 WHERE id = ?')
+      .run(hashPassword(adminPassword), existing.id);
+    console.log('✅ Senha do admin "joao" atualizada.');
+  } else {
+    db.prepare('INSERT INTO users (name, username, password_hash, role) VALUES (?, ?, ?, ?)')
+      .run('João Silva', 'joao', hashPassword(adminPassword), 'admin');
+    console.log('✅ Usuário admin "joao" criado.');
+  }
+}
 
 // ============================================================
 // ENTREGADORES EXEMPLO — SEÇÃO 18

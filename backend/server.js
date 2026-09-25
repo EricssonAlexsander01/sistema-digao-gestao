@@ -14,22 +14,32 @@
 // + FIX Ciclo 6 / AUD-PG-07: estorno (payments_refunds), financial_status ESTORNADO,
 //   cash_movements ESTORNO, endpoints de histórico de caixa
 // + FIX Ciclo 6 / BUG-D: expõe payments (plural) preservando payment (singular)
+// + FIX Ciclo 7 / AUTH: autenticação server-side com sessão + cookie HttpOnly.
+//   Toda rota é protegida por requireAuth/requireRole. Backend é a autoridade.
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const db = require('./database');
 const printer = require('./printer');
+const auth = require('./auth');
 
 const app = express();
 const PORT = 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(express.json());
 
 app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
+// Identifica req.user a partir do cookie (não bloqueia — só popula)
+app.use(auth.identifyUser);
+
 app.use((req, res, next) => {
-  console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${req.method} ${req.url}`);
+  const user = req.user ? req.user.username : 'anon';
+  console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${req.method} ${req.url} (${user})`);
   next();
 });
 
@@ -43,7 +53,6 @@ function getOpenCashRegister() {
   ).get();
 }
 
-// FIX Ciclo 4 / AUD-ME-06: pedido PAGO não é ativo.
 function getActiveOrderByTable(tableId) {
   const candidatos = db.prepare(`
     SELECT * FROM orders
@@ -84,7 +93,6 @@ function getPendingItems(orderId) {
 // HELPERS FINANCEIROS
 // ============================================================
 
-// Total BRUTO pago (soma dos pagamentos originais, ignorando estornos)
 function getOrderGrossPaid(orderId) {
   const row = db.prepare(`
     SELECT COALESCE(SUM(amount), 0) AS total
@@ -94,7 +102,6 @@ function getOrderGrossPaid(orderId) {
   return Number(row.total) || 0;
 }
 
-// Total já estornado do pedido
 function getOrderRefundsTotal(orderId) {
   const row = db.prepare(`
     SELECT COALESCE(SUM(amount), 0) AS total
@@ -104,14 +111,12 @@ function getOrderRefundsTotal(orderId) {
   return Number(row.total) || 0;
 }
 
-// Valor LÍQUIDO pago = pagamentos - estornos
 function getOrderNetPaid(orderId) {
   const gross = getOrderGrossPaid(orderId);
   const refunded = getOrderRefundsTotal(orderId);
   return Math.max(0, gross - refunded);
 }
 
-// Compatibilidade: outras partes ainda usam "getOrderPaymentsTotal"
 function getOrderPaymentsTotal(orderId) {
   return getOrderNetPaid(orderId);
 }
@@ -124,7 +129,6 @@ function getOrderRemaining(orderId) {
   return remaining > 0 ? remaining : 0;
 }
 
-// FIX Ciclo 6: retorna ESTORNADO quando houve pagamento e o líquido caiu a zero
 function getOrderFinancialStatus(orderId) {
   const order = db.prepare('SELECT total FROM orders WHERE id = ?').get(orderId);
   if (!order) return 'ABERTO';
@@ -149,7 +153,6 @@ function enrichOrderFinancials(order) {
   return order;
 }
 
-// Quanto ainda é estornável de um pagamento específico
 function getPaymentRefundable(paymentId) {
   const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
   if (!payment) return 0;
@@ -161,25 +164,214 @@ function getPaymentRefundable(paymentId) {
 }
 
 // ============================================================
-// ROTA RAIZ
+// AUTENTICAÇÃO
+// ============================================================
+
+// Login — público
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Usuário e senha obrigatórios' });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+
+  if (!user) {
+    return res.status(401).json({ error: 'Credenciais inválidas' });
+  }
+
+  if (!user.active) {
+    return res.status(401).json({ error: 'Usuário inativo' });
+  }
+
+  if (!user.password_hash) {
+    return res.status(401).json({ error: 'Usuário sem senha definida' });
+  }
+
+  if (!auth.verifyPassword(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Credenciais inválidas' });
+  }
+
+  // Limpa sessões expiradas oportunisticamente
+  auth.cleanupExpiredSessions();
+
+  // Cria sessão
+  const { token } = auth.createSession(user.id);
+  auth.setSessionCookie(res, token);
+
+  res.json({
+    user: {
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role
+    }
+  });
+});
+
+// Logout — autenticado
+app.post('/api/auth/logout', auth.requireAuth, (req, res) => {
+  const token = auth.getCookieToken(req);
+  if (token) auth.revokeSession(token);
+  auth.clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// Me — autenticado
+app.get('/api/auth/me', auth.requireAuth, (req, res) => {
+  res.json({
+    user: {
+      id: req.user.id,
+      name: req.user.name,
+      username: req.user.username,
+      role: req.user.role
+    }
+  });
+});
+
+// Alterar a própria senha — autenticado
+app.put('/api/auth/password', auth.requireAuth, (req, res) => {
+  const { current_password, new_password } = req.body || {};
+
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: 'Senha atual e nova senha obrigatórias' });
+  }
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: 'Nova senha precisa ter pelo menos 8 caracteres' });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+  if (!auth.verifyPassword(current_password, user.password_hash)) {
+    return res.status(401).json({ error: 'Senha atual incorreta' });
+  }
+
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .run(auth.hashPassword(new_password), user.id);
+
+  // Revoga todas as sessões do usuário (incluindo a atual)
+  auth.revokeAllUserSessions(user.id);
+  auth.clearSessionCookie(res);
+
+  res.json({ ok: true, message: 'Senha alterada. Faça login novamente.' });
+});
+
+// ============================================================
+// ADMINISTRAÇÃO DE USUÁRIOS — somente admin
+// ============================================================
+
+app.get('/api/users', auth.requireRole('admin'), (req, res) => {
+  const users = db.prepare(`
+    SELECT id, name, username, role, active, created_at
+    FROM users ORDER BY id ASC
+  `).all();
+  res.json(users);
+});
+
+app.post('/api/users', auth.requireRole('admin'), (req, res) => {
+  const { name, username, password, role } = req.body || {};
+
+  if (!name || !username || !password) {
+    return res.status(400).json({ error: 'Nome, username e senha obrigatórios' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'Senha precisa ter pelo menos 8 caracteres' });
+  }
+  if (!['admin', 'caixa', 'cozinha', 'garcom'].includes(role)) {
+    return res.status(400).json({ error: 'Role inválida' });
+  }
+
+  try {
+    const r = db.prepare(`
+      INSERT INTO users (name, username, password_hash, role, active)
+      VALUES (?, ?, ?, ?, 1)
+    `).run(name, username, auth.hashPassword(password), role);
+
+    res.json({ id: r.lastInsertRowid, name, username, role });
+  } catch (e) {
+    if (String(e.message).includes('UNIQUE')) {
+      return res.status(400).json({ error: 'Username já em uso' });
+    }
+    console.error('[users] erro:', e);
+    res.status(500).json({ error: 'Erro ao criar usuário' });
+  }
+});
+
+app.put('/api/users/:id', auth.requireRole('admin'), (req, res) => {
+  const { name, role, active } = req.body || {};
+  const id = Number(req.params.id);
+
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  if (!u) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+  if (role && !['admin', 'caixa', 'cozinha', 'garcom'].includes(role)) {
+    return res.status(400).json({ error: 'Role inválida' });
+  }
+
+  // Impede que o admin desative a si mesmo
+  if (id === req.user.id && active === false) {
+    return res.status(400).json({ error: 'Você não pode desativar a própria conta' });
+  }
+
+  db.prepare(`
+    UPDATE users SET name = ?, role = ?, active = ? WHERE id = ?
+  `).run(
+    name ?? u.name,
+    role ?? u.role,
+    active != null ? (active ? 1 : 0) : u.active,
+    id
+  );
+
+  // Se desativou, revoga todas as sessões do alvo
+  if (active === false) {
+    auth.revokeAllUserSessions(id);
+  }
+
+  res.json({ ok: true });
+});
+
+app.put('/api/users/:id/password', auth.requireRole('admin'), (req, res) => {
+  const { new_password } = req.body || {};
+  const id = Number(req.params.id);
+
+  if (!new_password || new_password.length < 8) {
+    return res.status(400).json({ error: 'Nova senha precisa ter pelo menos 8 caracteres' });
+  }
+
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  if (!u) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+    .run(auth.hashPassword(new_password), id);
+
+  // Revoga todas as sessões do alvo
+  auth.revokeAllUserSessions(id);
+
+  res.json({ ok: true, message: 'Senha redefinida. Sessões do usuário foram encerradas.' });
+});
+
+// ============================================================
+// ROTA RAIZ (pública — health/info)
 // ============================================================
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.6.2',
+    versao: '1.7.0',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
-    modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão', 'Estorno']
+    modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão', 'Estorno', 'Usuários']
   });
 });
 
 // ============================================================
 // CATEGORIES
 // ============================================================
-app.get('/api/categories', (req, res) => {
+app.get('/api/categories', auth.requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM categories WHERE active = 1').all());
 });
 
-app.post('/api/categories', (req, res) => {
+app.post('/api/categories', auth.requireRole('admin'), (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome obrigatório' });
   try {
@@ -193,7 +385,7 @@ app.post('/api/categories', (req, res) => {
 // ============================================================
 // PRODUCTS
 // ============================================================
-app.get('/api/products', (req, res) => {
+app.get('/api/products', auth.requireAuth, (req, res) => {
   const { category, active } = req.query;
   let sql = `
     SELECT p.*, c.name AS category
@@ -208,7 +400,7 @@ app.get('/api/products', (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.get('/api/products/barcode/:code', (req, res) => {
+app.get('/api/products/barcode/:code', auth.requireAuth, (req, res) => {
   const p = db.prepare(`
     SELECT p.*, c.name AS category
     FROM products p
@@ -219,7 +411,7 @@ app.get('/api/products/barcode/:code', (req, res) => {
   res.json(p);
 });
 
-app.post('/api/products', (req, res) => {
+app.post('/api/products', auth.requireRole('admin'), (req, res) => {
   const { category_id, name, price, is_additional, barcode } = req.body;
   if (!name || price == null) return res.status(400).json({ error: 'Nome e preço obrigatórios' });
   const r = db.prepare(
@@ -228,7 +420,7 @@ app.post('/api/products', (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-app.put('/api/products/:id', (req, res) => {
+app.put('/api/products/:id', auth.requireRole('admin'), (req, res) => {
   const { name, price, active, category_id, barcode } = req.body;
   const existing = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Produto não encontrado' });
@@ -246,7 +438,7 @@ app.put('/api/products/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/products/:id', (req, res) => {
+app.delete('/api/products/:id', auth.requireRole('admin'), (req, res) => {
   db.prepare('UPDATE products SET active = 0 WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
@@ -254,11 +446,11 @@ app.delete('/api/products/:id', (req, res) => {
 // ============================================================
 // WAITERS
 // ============================================================
-app.get('/api/waiters', (req, res) => {
+app.get('/api/waiters', auth.requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM waiters WHERE active = 1 ORDER BY name').all());
 });
 
-app.post('/api/waiters', (req, res) => {
+app.post('/api/waiters', auth.requireRole('admin'), (req, res) => {
   const { name, phone, code } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome obrigatório' });
   try {
@@ -270,7 +462,7 @@ app.post('/api/waiters', (req, res) => {
   }
 });
 
-app.put('/api/waiters/:id', (req, res) => {
+app.put('/api/waiters/:id', auth.requireRole('admin'), (req, res) => {
   const { name, phone, code, active } = req.body;
   const w = db.prepare('SELECT * FROM waiters WHERE id = ?').get(req.params.id);
   if (!w) return res.status(404).json({ error: 'Garçom não encontrado' });
@@ -289,7 +481,7 @@ app.put('/api/waiters/:id', (req, res) => {
 // ============================================================
 // TABLES
 // ============================================================
-app.get('/api/tables', (req, res) => {
+app.get('/api/tables', auth.requireAuth, (req, res) => {
   const tables = db.prepare(`
     SELECT t.*, w.name AS waiter_name
     FROM tables t
@@ -311,7 +503,7 @@ app.get('/api/tables', (req, res) => {
   res.json(tables);
 });
 
-app.post('/api/tables', (req, res) => {
+app.post('/api/tables', auth.requireRole('admin'), (req, res) => {
   const { number, name } = req.body;
   if (!number) return res.status(400).json({ error: 'Número obrigatório' });
   try {
@@ -323,7 +515,7 @@ app.post('/api/tables', (req, res) => {
   }
 });
 
-app.post('/api/tables/:id/open', (req, res) => {
+app.post('/api/tables/:id/open', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const { waiter_id } = req.body;
   const t = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
   if (!t) return res.status(404).json({ error: 'Mesa não encontrada' });
@@ -338,7 +530,7 @@ app.post('/api/tables/:id/open', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/tables/:id/close', (req, res) => {
+app.post('/api/tables/:id/close', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const t = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
   if (!t) return res.status(404).json({ error: 'Mesa não encontrada' });
 
@@ -360,7 +552,7 @@ app.post('/api/tables/:id/close', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/tables/:id/force-free', (req, res) => {
+app.post('/api/tables/:id/force-free', auth.requireRole('admin'), (req, res) => {
   const tableId = Number(req.params.id);
   const { reason } = req.body || {};
 
@@ -419,7 +611,7 @@ app.post('/api/tables/:id/force-free', (req, res) => {
   }
 });
 
-app.put('/api/tables/:id/waiter', (req, res) => {
+app.put('/api/tables/:id/waiter', auth.requireRole('admin','garcom'), (req, res) => {
   const tableId = Number(req.params.id);
   const { waiter_id } = req.body || {};
 
@@ -450,7 +642,7 @@ app.put('/api/tables/:id/waiter', (req, res) => {
 // ============================================================
 // ORDERS
 // ============================================================
-app.get('/api/orders', (req, res) => {
+app.get('/api/orders', auth.requireAuth, (req, res) => {
   const { status, channel, limit, date, table_id } = req.query;
   let sql = 'SELECT * FROM orders WHERE 1=1';
   const params = [];
@@ -464,7 +656,6 @@ app.get('/api/orders', (req, res) => {
   const orders = db.prepare(sql).all(...params);
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
-    // BUG-D FIX: expõe payments (plural) e mantém payment (singular) para compatibilidade
     o.payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(o.id);
     o.payment = o.payments[0] || null;
     enrichOrderFinancials(o);
@@ -478,11 +669,10 @@ app.get('/api/orders', (req, res) => {
   res.json(orders);
 });
 
-app.get('/api/orders/:id', (req, res) => {
+app.get('/api/orders/:id', auth.requireAuth, (req, res) => {
   const o = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
   o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
-  // BUG-D FIX: expõe payments (plural) e mantém payment (singular)
   o.payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(o.id);
   o.payment = o.payments[0] || null;
   enrichOrderFinancials(o);
@@ -495,7 +685,7 @@ app.get('/api/orders/:id', (req, res) => {
   res.json(o);
 });
 
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const {
     channel, items, observation,
     customer_name, customer_phone, customer_address,
@@ -667,7 +857,7 @@ app.post('/api/orders', (req, res) => {
   }
 });
 
-app.put('/api/orders/:id', (req, res) => {
+app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'), (req, res) => {
   const { status } = req.body;
   const valid = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'Status inválido' });
@@ -693,7 +883,7 @@ app.put('/api/orders/:id', (req, res) => {
 // ============================================================
 // PAYMENTS
 // ============================================================
-app.post('/api/orders/:id/payment', (req, res) => {
+app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res) => {
   const body = req.body || {};
   const { method, received } = body;
 
@@ -711,7 +901,6 @@ app.post('/api/orders/:id/payment', (req, res) => {
     return res.status(404).json({ error: 'Pedido não encontrado' });
   }
 
-  // FIX Ciclo 6: pedido totalmente estornado não aceita novo pagamento
   const fsAtual = getOrderFinancialStatus(order.id);
   if (fsAtual === 'ESTORNADO') {
     return res.status(400).json({
@@ -878,13 +1067,12 @@ app.post('/api/orders/:id/payment', (req, res) => {
 });
 
 // ============================================================
-// REFUND (Estorno) — Ciclo 6 / AUD-PG-07
+// REFUND (Estorno) — somente admin
 // ============================================================
-app.post('/api/orders/:id/refund', (req, res) => {
+app.post('/api/orders/:id/refund', auth.requireRole('admin'), (req, res) => {
   const orderId = Number(req.params.id);
   const { amount, reason, payment_id } = req.body || {};
 
-  // Validações
   if (!reason || typeof reason !== 'string' || reason.trim().length < 3) {
     return res.status(400).json({ error: 'RN032: Motivo obrigatório (mínimo 3 caracteres).' });
   }
@@ -921,11 +1109,10 @@ app.post('/api/orders/:id/refund', (req, res) => {
 
   try {
     const executar = db.transaction(() => {
-      const refunds = []; // registros a inserir em payments_refunds
+      const refunds = [];
       let restante = amt;
 
       if (payment_id != null) {
-        // Caminho A: estorno direcionado a um pagamento específico
         const pid = Number(payment_id);
         if (!Number.isInteger(pid) || pid <= 0) {
           const err = new Error('payment_id inválido');
@@ -946,7 +1133,6 @@ app.post('/api/orders/:id/refund', (req, res) => {
         }
         refunds.push({ payment_id: pid, amount: amt });
       } else {
-        // Caminho B: FIFO sobre pagamentos elegíveis
         const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(orderId);
         for (const p of payments) {
           if (restante <= 0) break;
@@ -963,20 +1149,17 @@ app.post('/api/orders/:id/refund', (req, res) => {
         }
       }
 
-      // Insere os refunds
       const insertRefund = db.prepare(`
         INSERT INTO payments_refunds (payment_id, order_id, amount, reason)
         VALUES (?, ?, ?, ?)
       `);
       refunds.forEach(r => insertRefund.run(r.payment_id, orderId, r.amount, motivoLimpo));
 
-      // Cria um único cash_movement de ESTORNO com o total
       db.prepare(`
         INSERT INTO cash_movements (register_id, type, description, amount)
         VALUES (?, 'ESTORNO', ?, ?)
       `).run(register.id, `Estorno Pedido #${order.number} — ${motivoLimpo}`, amt);
 
-      // Verifica se a mesa pode ser liberada
       if (order.table_id) {
         const pedidosAtivos = db.prepare(`
           SELECT id FROM orders
@@ -1026,7 +1209,7 @@ app.post('/api/orders/:id/refund', (req, res) => {
 // ============================================================
 // SEND TO KITCHEN
 // ============================================================
-app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
+app.post('/api/orders/:id/send-to-kitchen', auth.requireRole('admin','caixa','garcom','cozinha'), async (req, res) => {
   const orderId = Number(req.params.id);
 
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
@@ -1089,11 +1272,10 @@ app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
 // ============================================================
 // ESTADO FINANCEIRO
 // ============================================================
-app.get('/api/orders/:id/financial', (req, res) => {
+app.get('/api/orders/:id/financial', auth.requireRole('admin','caixa'), (req, res) => {
   const o = db.prepare('SELECT id FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
 
-  // BUG-D FIX: expõe payments (plural) e mantém payment (singular)
   const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(req.params.id);
   const refunds = db.prepare('SELECT * FROM payments_refunds WHERE order_id = ? ORDER BY id ASC').all(req.params.id);
 
@@ -1113,7 +1295,7 @@ app.get('/api/orders/:id/financial', (req, res) => {
 // ============================================================
 // COMANDA
 // ============================================================
-app.get('/api/orders/:id/comanda', (req, res) => {
+app.get('/api/orders/:id/comanda', auth.requireAuth, (req, res) => {
   const o = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
   const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
@@ -1157,7 +1339,7 @@ app.get('/api/orders/:id/comanda', (req, res) => {
 // ============================================================
 // KITCHEN
 // ============================================================
-app.get('/api/kitchen', (req, res) => {
+app.get('/api/kitchen', auth.requireRole('admin','caixa','cozinha'), (req, res) => {
   const orders = db.prepare(`
     SELECT * FROM orders
     WHERE status IN ('NOVO','EM PREPARO')
@@ -1176,13 +1358,13 @@ app.get('/api/kitchen', (req, res) => {
 // ============================================================
 // IMPRESSÃO
 // ============================================================
-app.post('/api/print/test', async (req, res) => {
+app.post('/api/print/test', auth.requireRole('admin'), async (req, res) => {
   const result = await printer.imprimirTeste();
   if (result.ok) res.json({ ok: true });
   else res.status(500).json({ error: result.error });
 });
 
-app.post('/api/print/comanda/:id', async (req, res) => {
+app.post('/api/print/comanda/:id', auth.requireAuth, async (req, res) => {
   const o = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
 
@@ -1198,7 +1380,7 @@ app.post('/api/print/comanda/:id', async (req, res) => {
 // ============================================================
 // CASH REGISTER
 // ============================================================
-app.get('/api/cash/current', (req, res) => {
+app.get('/api/cash/current', auth.requireRole('admin','caixa'), (req, res) => {
   const reg = getOpenCashRegister();
   if (!reg) return res.json(null);
   const movements = db.prepare(
@@ -1212,7 +1394,7 @@ app.get('/api/cash/current', (req, res) => {
   res.json({ ...reg, movements, sales, entries, exits, refunds, current });
 });
 
-app.post('/api/cash/open', (req, res) => {
+app.post('/api/cash/open', auth.requireRole('admin','caixa'), (req, res) => {
   const { initial_value } = req.body;
   const existing = getOpenCashRegister();
   if (existing) return res.status(400).json({ error: 'Já existe um caixa aberto' });
@@ -1221,7 +1403,7 @@ app.post('/api/cash/open', (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-app.post('/api/cash/close', (req, res) => {
+app.post('/api/cash/close', auth.requireRole('admin','caixa'), (req, res) => {
   const { informed_value } = req.body;
   const reg = getOpenCashRegister();
   if (!reg) return res.status(400).json({ error: 'Nenhum caixa aberto' });
@@ -1295,7 +1477,7 @@ app.post('/api/cash/close', (req, res) => {
   res.json({ expected, informed: Number(informed_value), difference: diff });
 });
 
-app.post('/api/cash/movement', (req, res) => {
+app.post('/api/cash/movement', auth.requireRole('admin','caixa'), (req, res) => {
   const { type, description, amount } = req.body;
   const reg = getOpenCashRegister();
   if (!reg) return res.status(400).json({ error: 'Caixa fechado' });
@@ -1319,7 +1501,7 @@ app.post('/api/cash/movement', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/cash/movements', (req, res) => {
+app.get('/api/cash/movements', auth.requireRole('admin','caixa'), (req, res) => {
   const reg = getOpenCashRegister();
   if (!reg) return res.json([]);
   res.json(db.prepare(
@@ -1327,10 +1509,7 @@ app.get('/api/cash/movements', (req, res) => {
   ).all(reg.id));
 });
 
-// ============================================================
-// CASH HISTORY — Ciclo 6
-// ============================================================
-app.get('/api/cash/history', (req, res) => {
+app.get('/api/cash/history', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to, page = 1, limit = 20 } = req.query;
 
   const limitNum = Math.min(Math.max(parseInt(limit) || 20, 1), 100);
@@ -1360,7 +1539,6 @@ app.get('/api/cash/history', (req, res) => {
     LIMIT ? OFFSET ?
   `).all(...params, limitNum, offset);
 
-  // Enriquece cada caixa com agregados de cash_movements
   const items = rows.map(r => {
     const movements = db.prepare('SELECT * FROM cash_movements WHERE register_id = ?').all(r.id);
     const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
@@ -1379,7 +1557,7 @@ app.get('/api/cash/history', (req, res) => {
   });
 });
 
-app.get('/api/cash/:id', (req, res) => {
+app.get('/api/cash/:id', auth.requireRole('admin','caixa'), (req, res) => {
   const id = Number(req.params.id);
   const reg = db.prepare('SELECT * FROM cash_registers WHERE id = ?').get(id);
   if (!reg) return res.status(404).json({ error: 'Caixa não encontrado' });
@@ -1399,7 +1577,7 @@ app.get('/api/cash/:id', (req, res) => {
 // ============================================================
 // EXPENSES / LOSSES
 // ============================================================
-app.get('/api/expenses', (req, res) => {
+app.get('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to } = req.query;
   let sql = 'SELECT * FROM expenses WHERE 1=1';
   const params = [];
@@ -1409,7 +1587,7 @@ app.get('/api/expenses', (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.post('/api/expenses', (req, res) => {
+app.post('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
   const { description, category, amount } = req.body;
   if (!description || amount == null) {
     return res.status(400).json({ error: 'Descrição e valor obrigatórios' });
@@ -1419,7 +1597,7 @@ app.post('/api/expenses', (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-app.get('/api/losses', (req, res) => {
+app.get('/api/losses', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to } = req.query;
   let sql = 'SELECT * FROM losses WHERE 1=1';
   const params = [];
@@ -1429,7 +1607,7 @@ app.get('/api/losses', (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
-app.post('/api/losses', (req, res) => {
+app.post('/api/losses', auth.requireRole('admin','caixa'), (req, res) => {
   const { description, category, amount } = req.body;
   if (!description || amount == null) {
     return res.status(400).json({ error: 'Descrição e valor obrigatórios' });
@@ -1442,11 +1620,11 @@ app.post('/api/losses', (req, res) => {
 // ============================================================
 // DRIVERS
 // ============================================================
-app.get('/api/drivers', (req, res) => {
+app.get('/api/drivers', auth.requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM drivers ORDER BY id DESC').all());
 });
 
-app.post('/api/drivers', (req, res) => {
+app.post('/api/drivers', auth.requireRole('admin'), (req, res) => {
   const { name, phone, default_fee } = req.body;
   if (!name) return res.status(400).json({ error: 'Nome obrigatório' });
   const r = db.prepare('INSERT INTO drivers (name, phone, default_fee) VALUES (?,?,?)')
@@ -1454,7 +1632,7 @@ app.post('/api/drivers', (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-app.put('/api/drivers/:id', (req, res) => {
+app.put('/api/drivers/:id', auth.requireRole('admin'), (req, res) => {
   const { name, phone, default_fee, active } = req.body;
   const d = db.prepare('SELECT * FROM drivers WHERE id = ?').get(req.params.id);
   if (!d) return res.status(404).json({ error: 'Entregador não encontrado' });
@@ -1473,7 +1651,7 @@ app.put('/api/drivers/:id', (req, res) => {
 // ============================================================
 // DELIVERIES
 // ============================================================
-app.get('/api/deliveries', (req, res) => {
+app.get('/api/deliveries', auth.requireAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT d.*, dr.name AS driver_name, o.number AS order_number
     FROM deliveries d
@@ -1484,7 +1662,7 @@ app.get('/api/deliveries', (req, res) => {
   res.json(rows);
 });
 
-app.post('/api/deliveries', (req, res) => {
+app.post('/api/deliveries', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const { order_id, driver_id, fee } = req.body;
   if (!order_id || !driver_id) {
     return res.status(400).json({ error: 'Pedido e entregador obrigatórios' });
@@ -1501,7 +1679,7 @@ app.post('/api/deliveries', (req, res) => {
   res.json({ id: r.lastInsertRowid, fee: finalFee });
 });
 
-app.get('/api/drivers/:id/summary', (req, res) => {
+app.get('/api/drivers/:id/summary', auth.requireRole('admin','caixa'), (req, res) => {
   const driver = db.prepare('SELECT * FROM drivers WHERE id = ?').get(req.params.id);
   if (!driver) return res.status(404).json({ error: 'Entregador não encontrado' });
 
@@ -1522,7 +1700,7 @@ app.get('/api/drivers/:id/summary', (req, res) => {
   res.json({ driver, pending, paid, history });
 });
 
-app.post('/api/drivers/:id/pay', (req, res) => {
+app.post('/api/drivers/:id/pay', auth.requireRole('admin','caixa'), (req, res) => {
   const driverId = req.params.id;
   const unpaid = db.prepare(`
     SELECT * FROM deliveries WHERE driver_id = ? AND status = 'PENDENTE'
@@ -1550,7 +1728,7 @@ app.post('/api/drivers/:id/pay', (req, res) => {
 // ============================================================
 // DASHBOARD
 // ============================================================
-app.get('/api/dashboard', (req, res) => {
+app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
@@ -1600,7 +1778,7 @@ app.get('/api/dashboard', (req, res) => {
 // ============================================================
 // RELATÓRIOS
 // ============================================================
-app.get('/api/reports', (req, res) => {
+app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to } = req.query;
   const fromDate = from || '2000-01-01';
   const toDate = to || '2100-01-01';
@@ -1667,9 +1845,9 @@ app.get('/api/reports', (req, res) => {
 });
 
 // ============================================================
-// BACKUP
+// BACKUP — somente admin
 // ============================================================
-app.post('/api/backup', (req, res) => {
+app.post('/api/backup', auth.requireRole('admin'), (req, res) => {
   try {
     const fs = require('fs');
     const backupDir = path.join(__dirname, 'data', 'backup');
@@ -1709,7 +1887,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6.2');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.7.0');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');
@@ -1725,6 +1903,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log(`   📂 Banco:       backend/data/digao.db`);
+  console.log(`   🔐 Auth:        sessão em cookie HttpOnly (8h)`);
   console.log(`   🕐 Timezone:    LOCAL (created_at interpretado no fuso do servidor)`);
   console.log(`   🖨️  Impressão:   ${process.env.PRINTER_SIMULATED === 'true' ? 'SIMULADA' : 'REAL'} (${process.env.PRINTER_NAME || 'mp4200'})`);
   console.log('================================================');
