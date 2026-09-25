@@ -377,8 +377,6 @@ async function confirmarWhatsApp() {
       channel: 'WHATSAPP',
       items: wsCarrinho.map(i => ({
         product_id: i.product_id,
-        name: i.name,
-        price: i.price,
         quantity: i.quantity
       })),
       customer_name: name,

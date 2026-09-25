@@ -12,6 +12,9 @@
 // + FIX Ciclo 1 Etapa 4: financial_status derivado em todas as consultas
 // + FIX Ciclo 1 Etapa 6: cash/close bloqueia com pendências financeiras
 // + FIX Ciclo 1 Etapa 8: cash/movement valida amount (RN027/RN028/RN029)
+// + FIX Ciclo 2: POST /orders valida itens, consulta produto no banco,
+//   ignora name/price do payload (AUD-PD-01..05 / F-P) e executa
+//   order + order_items em transação atômica com nextNum interno.
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -116,7 +119,7 @@ function enrichOrderFinancials(order) {
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.6.1',
+    versao: '1.6.2',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
     modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão']
   });
@@ -363,6 +366,12 @@ app.get('/api/orders/:id', (req, res) => {
   res.json(o);
 });
 
+// ============================================================
+// POST /api/orders — Ciclo 2
+// Backend é a autoridade: valida itens, consulta products no banco
+// e usa name/price/active reais. Payload nunca define nome nem preço.
+// Tudo em transação atômica (inclui nextNum e abertura de mesa).
+// ============================================================
 app.post('/api/orders', (req, res) => {
   const {
     channel, items, observation,
@@ -371,117 +380,169 @@ app.post('/api/orders', (req, res) => {
     table_id, waiter_id
   } = req.body;
 
-  if (!items || items.length === 0) {
-    return res.status(400).json({ error: 'RN001: Pedido precisa de pelo menos um produto' });
-  }
-
+  // ---------- validação de canal e payload básico ----------
   if (!['BALCAO', 'WHATSAPP', 'MESA', 'IFOOD'].includes(channel)) {
     return res.status(400).json({ error: 'Canal inválido' });
+  }
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'RN001: Pedido precisa de pelo menos um produto' });
   }
 
   if (channel === 'MESA' && !table_id) {
     return res.status(400).json({ error: 'Pedido de mesa precisa de table_id' });
   }
 
-  if (channel === 'MESA') {
-    const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(table_id);
-    if (!mesa) return res.status(404).json({ error: 'Mesa não encontrada' });
-
-    if (mesa.status === 'LIVRE') {
-      db.prepare(`
-        UPDATE tables
-        SET status = 'OCUPADA', waiter_id = ?, opened_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(waiter_id || null, mesa.id);
+  // ---------- validação + resolução de itens (AUD-PD-01..05 / F-P) ----------
+  const itensResolvidos = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') {
+      return res.status(400).json({ error: 'Item inválido no pedido' });
     }
 
-    const pedidoExistente = getActiveOrderByTable(table_id);
+    const productId = Number(it.product_id);
+    if (!Number.isInteger(productId) || productId <= 0) {
+      return res.status(400).json({ error: 'Item sem product_id válido' });
+    }
 
-    if (pedidoExistente) {
+    const qtd = Number(it.quantity);
+    if (!Number.isInteger(qtd) || qtd <= 0) {
+      return res.status(400).json({ error: 'Quantidade inválida no item' });
+    }
+
+    const prod = db.prepare('SELECT id, name, price, active FROM products WHERE id = ?').get(productId);
+    if (!prod) {
+      return res.status(400).json({ error: `Produto ${productId} não encontrado` });
+    }
+
+    if (!prod.active) {
+      return res.status(400).json({ error: `Produto ${prod.name} está inativo` });
+    }
+
+    itensResolvidos.push({
+      product_id: prod.id,
+      name: prod.name,
+      price: prod.price,
+      quantity: qtd,
+      observation: (it.observation != null && String(it.observation).trim())
+        ? String(it.observation).trim()
+        : null
+    });
+  }
+
+  const subtotal = itensResolvidos.reduce((s, i) => s + i.price * i.quantity, 0);
+  const fee = Number(delivery_fee || 0);
+  const total = subtotal + fee;
+
+  // ---------- transação atômica ----------
+  try {
+    const executar = db.transaction(() => {
+
+      if (channel === 'MESA') {
+        const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(table_id);
+        if (!mesa) {
+          const err = new Error('Mesa não encontrada');
+          err.status = 404;
+          throw err;
+        }
+
+        if (mesa.status === 'LIVRE') {
+          db.prepare(`
+            UPDATE tables
+            SET status = 'OCUPADA', waiter_id = ?, opened_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(waiter_id || null, mesa.id);
+        }
+
+        const pedidoExistente = getActiveOrderByTable(table_id);
+
+        if (pedidoExistente) {
+          const insertItem = db.prepare(`
+            INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
+            VALUES (?,?,?,?,?,?,0)
+          `);
+
+          itensResolvidos.forEach(it => {
+            insertItem.run(
+              pedidoExistente.id,
+              it.product_id,
+              it.name,
+              it.price,
+              it.quantity,
+              it.observation
+            );
+          });
+
+          if (observation) {
+            const obsAtual = pedidoExistente.observation || '';
+            const novaObs = obsAtual ? `${obsAtual} | ${observation}` : observation;
+            db.prepare('UPDATE orders SET observation = ? WHERE id = ?')
+              .run(novaObs, pedidoExistente.id);
+          }
+
+          const totais = recalcularTotaisPedido(pedidoExistente.id);
+
+          return {
+            id: pedidoExistente.id,
+            number: pedidoExistente.number,
+            ...totais,
+            itensAdicionados: itensResolvidos.length,
+            jaExistia: true,
+            financial_status: getOrderFinancialStatus(pedidoExistente.id),
+            payments_total: getOrderPaymentsTotal(pedidoExistente.id),
+            remaining: getOrderRemaining(pedidoExistente.id)
+          };
+        }
+      }
+
+      const nextNum = db.prepare('SELECT COALESCE(MAX(number),0)+1 AS n FROM orders').get().n;
+
+      const result = db.prepare(`
+        INSERT INTO orders (
+          number, channel, status, subtotal, delivery_fee, total, observation,
+          customer_name, customer_phone, customer_address, customer_neighborhood, customer_complement,
+          table_id, waiter_id
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        nextNum, channel, 'NOVO', subtotal, fee, total, observation || null,
+        customer_name || null, customer_phone || null, customer_address || null,
+        customer_neighborhood || null, customer_complement || null,
+        table_id || null, waiter_id || null
+      );
+
+      const orderId = result.lastInsertRowid;
       const insertItem = db.prepare(`
         INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
         VALUES (?,?,?,?,?,?,0)
       `);
-
-      const adicionar = db.transaction(() => {
-        items.forEach(it => {
-          insertItem.run(
-            pedidoExistente.id,
-            it.product_id || null,
-            it.name,
-            it.price,
-            it.quantity,
-            it.observation || null
-          );
-        });
-
-        if (observation) {
-          const obsAtual = pedidoExistente.observation || '';
-          const novaObs = obsAtual
-            ? `${obsAtual} | ${observation}`
-            : observation;
-          db.prepare('UPDATE orders SET observation = ? WHERE id = ?')
-            .run(novaObs, pedidoExistente.id);
-        }
+      itensResolvidos.forEach(it => {
+        insertItem.run(orderId, it.product_id, it.name, it.price, it.quantity, it.observation);
       });
 
-      adicionar();
+      return {
+        id: orderId,
+        number: nextNum,
+        subtotal,
+        delivery_fee: fee,
+        total,
+        jaExistia: false,
+        financial_status: 'ABERTO',
+        payments_total: 0,
+        remaining: total
+      };
+    });
 
-      const totais = recalcularTotaisPedido(pedidoExistente.id);
+    const resultado = executar();
+    return res.json(resultado);
 
-      return res.json({
-        id: pedidoExistente.id,
-        number: pedidoExistente.number,
-        ...totais,
-        itensAdicionados: items.length,
-        jaExistia: true,
-        financial_status: getOrderFinancialStatus(pedidoExistente.id),
-        payments_total: getOrderPaymentsTotal(pedidoExistente.id),
-        remaining: getOrderRemaining(pedidoExistente.id)
-      });
+  } catch (e) {
+    if (e.status === 404) {
+      return res.status(404).json({ error: e.message });
     }
+    console.error('[orders] erro na transação:', e);
+    return res.status(500).json({ error: 'Erro ao criar pedido' });
   }
-
-  const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0);
-  const fee = Number(delivery_fee || 0);
-  const total = subtotal + fee;
-
-  const nextNum = db.prepare('SELECT COALESCE(MAX(number),0)+1 AS n FROM orders').get().n;
-
-  const result = db.prepare(`
-    INSERT INTO orders (
-      number, channel, status, subtotal, delivery_fee, total, observation,
-      customer_name, customer_phone, customer_address, customer_neighborhood, customer_complement,
-      table_id, waiter_id
-    )
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `).run(
-    nextNum, channel, 'NOVO', subtotal, fee, total, observation || null,
-    customer_name || null, customer_phone || null, customer_address || null,
-    customer_neighborhood || null, customer_complement || null,
-    table_id || null, waiter_id || null
-  );
-
-  const orderId = result.lastInsertRowid;
-  const insertItem = db.prepare(`
-    INSERT INTO order_items (order_id, product_id, name, price, quantity, observation, print_status)
-    VALUES (?,?,?,?,?,?,0)
-  `);
-  items.forEach(it => {
-    insertItem.run(orderId, it.product_id || null, it.name, it.price, it.quantity, it.observation || null);
-  });
-
-  res.json({
-    id: orderId,
-    number: nextNum,
-    subtotal,
-    delivery_fee: fee,
-    total,
-    jaExistia: false,
-    financial_status: 'ABERTO',
-    payments_total: 0,
-    remaining: total
-  });
 });
 
 app.put('/api/orders/:id', (req, res) => {
@@ -946,7 +1007,6 @@ app.post('/api/cash/close', (req, res) => {
   res.json({ expected, informed: Number(informed_value), difference: diff });
 });
 
-// FIX Ciclo 1 — RN027/RN028/RN029: validação de amount em movimentação manual
 app.post('/api/cash/movement', (req, res) => {
   const { type, description, amount } = req.body;
   const reg = getOpenCashRegister();
@@ -1292,7 +1352,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6.1');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6.2');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');

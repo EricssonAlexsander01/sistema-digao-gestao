@@ -575,8 +575,6 @@ async function confirmarVenda() {
       channel: mesaCtx ? 'MESA' : Digao.state.channel,
       items: cart.map(i => ({
         product_id: i.product_id,
-        name: i.name,
-        price: i.price,
         quantity: i.quantity,
         observation: i.observation || null
       })),
