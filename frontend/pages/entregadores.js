@@ -1,10 +1,11 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Entregadores (com filtros + total)
+   FIX Bug #4c: timezone em todas as conversões de data
    ============================================================ */
 
 let driversCache = [];
 let deliveriesCache = [];
-let delivFiltro = { periodo: 'hoje', driverId: 'todos' };
+let delivFiltro = { periodo: 'mes', driverId: 'todos' };
 
 // ============================================================
 // LOADER
@@ -27,6 +28,7 @@ async function recarregarDados() {
 
 // ============================================================
 // FILTROS DE PERÍODO
+// FIX Bug #4c — + 'Z' na conversão de created_at
 // ============================================================
 function filtrarDeliveries() {
   const agora = new Date();
@@ -39,7 +41,8 @@ function filtrarDeliveries() {
     }
 
     // Filtro por período
-    const data = new Date(d.created_at.replace(' ', 'T'));
+    const data = new Date(d.created_at.replace(' ', 'T') + 'Z');
+
     if (delivFiltro.periodo === 'hoje') {
       return data >= hoje;
     }
@@ -90,11 +93,11 @@ function renderEntregadoresLayout() {
 
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <select class="select" id="filtro-periodo" style="padding:6px 10px;font-size:12px">
-              <option value="hoje">Hoje</option>
-              <option value="ontem">Ontem</option>
-              <option value="semana">Últimos 7 dias</option>
-              <option value="mes" selected>Últimos 30 dias</option>
-              <option value="todos">Todos</option>
+              <option value="hoje" ${delivFiltro.periodo === 'hoje' ? 'selected' : ''}>Hoje</option>
+              <option value="ontem" ${delivFiltro.periodo === 'ontem' ? 'selected' : ''}>Ontem</option>
+              <option value="semana" ${delivFiltro.periodo === 'semana' ? 'selected' : ''}>Últimos 7 dias</option>
+              <option value="mes" ${delivFiltro.periodo === 'mes' ? 'selected' : ''}>Últimos 30 dias</option>
+              <option value="todos" ${delivFiltro.periodo === 'todos' ? 'selected' : ''}>Todos</option>
             </select>
             <select class="select" id="filtro-driver" style="padding:6px 10px;font-size:12px">
               <option value="todos">Todos os entregadores</option>
@@ -110,12 +113,13 @@ function renderEntregadoresLayout() {
 
 // ============================================================
 // RESUMO — TOTAL A PAGAR HOJE
+// FIX Bug #4c — + 'Z' na conversão de created_at
 // ============================================================
 function renderResumoTopo() {
   const hoje = new Date();
   const inicioDia = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate());
 
-  const doDia = deliveriesCache.filter(d => new Date(d.created_at.replace(' ', 'T')) >= inicioDia);
+  const doDia = deliveriesCache.filter(d => new Date(d.created_at.replace(' ', 'T') + 'Z') >= inicioDia);
   const pendentes = doDia.filter(d => d.status === 'PENDENTE');
   const totalPendente = pendentes.reduce((s, d) => s + d.fee, 0);
   const totalPago = doDia.filter(d => d.status === 'PAGO').reduce((s, d) => s + d.fee, 0);
@@ -173,7 +177,6 @@ function renderDriversGrid() {
 
   grid.innerHTML = driversCache.map(d => renderDriverCard(d)).join('');
 
-  // Carrega pendências de cada um
   driversCache.forEach(async d => {
     try {
       const summary = await Digao.get(`/drivers/${d.id}/summary`);
