@@ -1,5 +1,9 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Mesas (Mapa visual)
+   FIX Ciclo 4 / AUD-ME-02: force-free com motivo obrigatório
+     (modal próprio) e envio para backend com auditoria.
+   FIX Ciclo 4 / AUD-ME-05: troca de garçom em mesa ocupada,
+     afetando somente tables.waiter_id.
    ============================================================ */
 
 let mesasCache = [];
@@ -252,6 +256,9 @@ function abrirModalGerenciarMesa(mesa) {
           <i class="fa-solid fa-plus"></i> Iniciar pedido
         </button>
       `}
+      <button class="btn btn-secondary btn-block" id="mesa-trocar-garcom">
+        <i class="fa-solid fa-user-pen"></i> Trocar garçom
+      </button>
       <button class="btn btn-secondary btn-block" id="mesa-cancelar">
         Cancelar
       </button>
@@ -281,13 +288,132 @@ function abrirModalGerenciarMesa(mesa) {
     location.hash = `pdv?table=${mesa.id}&pay=${order.id}`;
   });
 
-  document.getElementById('mesa-force-free').addEventListener('click', async () => {
-    if (!confirm(`Tem certeza que quer FORÇAR a liberação da ${mesa.name}? Isso NÃO cancela pedidos abertos.`)) return;
-    await Digao.post(`/tables/${mesa.id}/force-free`);
-    Digao.toast(`${mesa.name} liberada à força`, 'warning');
+  document.getElementById('mesa-trocar-garcom').addEventListener('click', () => {
     m.close();
-    mesasCache = await Digao.get('/tables');
-    renderMesasGrid();
+    abrirModalTrocarGarcom(mesa);
+  });
+
+  document.getElementById('mesa-force-free').addEventListener('click', () => {
+    m.close();
+    abrirModalForceFree(mesa);
+  });
+}
+
+// ============================================================
+// MODAL — TROCAR GARÇOM (AUD-ME-05)
+// ============================================================
+function abrirModalTrocarGarcom(mesa) {
+  const html = `
+    <h3>Trocar garçom — ${escapeHtml(mesa.name)}</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">
+      O histórico dos pedidos já lançados NÃO é alterado.
+      A troca vale apenas para futuras operações nesta mesa.
+    </p>
+
+    <div class="label">Novo garçom</div>
+    <div style="display:flex;flex-direction:column;gap:8px;max-height:280px;overflow-y:auto">
+      ${garconsCache.map(g => `
+        <button class="garcom-pick" data-id="${g.id}" data-name="${escapeAttr(g.name)}" style="
+          display:flex;align-items:center;gap:12px;padding:12px 14px;
+          background:var(--bg-dark);border:1px solid var(--border);
+          border-radius:10px;cursor:pointer;text-align:left;
+          color:var(--text-main);font-family:inherit;transition:0.15s;width:100%
+        ">
+          <div style="width:38px;height:38px;background:linear-gradient(135deg,var(--primary),var(--primary-dark));color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;flex-shrink:0">
+            ${g.name.split(' ').map(n => n[0]).slice(0,2).join('').toUpperCase()}
+          </div>
+          <div style="flex:1">
+            <div style="font-size:14px;font-weight:700">${escapeHtml(g.name)}</div>
+            <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px">Código: ${escapeHtml(g.code || '—')}</div>
+          </div>
+          <i class="fa-solid fa-chevron-right" style="color:var(--text-dim)"></i>
+        </button>
+      `).join('')}
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="tg-cancel">Cancelar</button>
+    </div>
+  `;
+
+  const m = Digao.modal(html);
+  document.getElementById('tg-cancel').addEventListener('click', () => m.close());
+
+  m.overlay.querySelectorAll('.garcom-pick').forEach(btn => {
+    btn.addEventListener('mouseenter', () => {
+      btn.style.background = 'var(--bg-hover)';
+      btn.style.borderColor = 'var(--primary)';
+    });
+    btn.addEventListener('mouseleave', () => {
+      btn.style.background = 'var(--bg-dark)';
+      btn.style.borderColor = 'var(--border)';
+    });
+    btn.addEventListener('click', async () => {
+      const waiterId = Number(btn.dataset.id);
+      const waiterName = btn.dataset.name;
+      try {
+        await Digao.put(`/tables/${mesa.id}/waiter`, { waiter_id: waiterId });
+        Digao.toast(`${mesa.name}: garçom trocado para ${waiterName}`, 'success');
+        m.close();
+        mesasCache = await Digao.get('/tables');
+        renderMesasGrid();
+      } catch (e) { /* já tratado */ }
+    });
+  });
+}
+
+// ============================================================
+// MODAL — FORCE-FREE (AUD-ME-02)
+// ============================================================
+function abrirModalForceFree(mesa) {
+  const html = `
+    <h3 style="margin-bottom:6px">Forçar liberação — ${escapeHtml(mesa.name)}</h3>
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px">
+      Esta ação libera a mesa <strong>imediatamente</strong>, mesmo que exista pedido em aberto.
+      O pedido <strong>não é cancelado</strong> — apenas deixa de estar vinculado a esta mesa.
+    </p>
+
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12.5px;color:var(--text-muted)">
+      <strong style="color:var(--danger)">⚠️ Atenção:</strong> use apenas em situações reais
+      (cliente foi embora, erro operacional, mesa travada). Toda liberação forçada é registrada em auditoria.
+    </div>
+
+    <label class="label">Motivo da liberação forçada *</label>
+    <textarea
+      class="input"
+      id="ff-reason"
+      rows="3"
+      placeholder="Ex: Cliente foi embora sem pagar / Mesa travada por erro de sistema / Garçom lançou item por engano"
+      style="resize:none;font-family:inherit;font-size:13px"
+    ></textarea>
+    <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Mínimo 3 caracteres.</div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" id="ff-cancel">Cancelar</button>
+      <button class="btn btn-danger" id="ff-confirm">
+        <i class="fa-solid fa-triangle-exclamation"></i> Confirmar liberação
+      </button>
+    </div>
+  `;
+
+  const m = Digao.modal(html);
+
+  document.getElementById('ff-cancel').addEventListener('click', () => m.close());
+
+  document.getElementById('ff-confirm').addEventListener('click', async () => {
+    const reason = document.getElementById('ff-reason').value.trim();
+    if (!reason || reason.length < 3) {
+      Digao.toast('Motivo obrigatório (mínimo 3 caracteres).', 'error');
+      return;
+    }
+
+    try {
+      await Digao.post(`/tables/${mesa.id}/force-free`, { reason });
+      Digao.toast(`${mesa.name} liberada à força. Motivo registrado.`, 'warning', 4000);
+      m.close();
+      mesasCache = await Digao.get('/tables');
+      renderMesasGrid();
+    } catch (e) { /* já tratado pelo Digao.api */ }
   });
 }
 

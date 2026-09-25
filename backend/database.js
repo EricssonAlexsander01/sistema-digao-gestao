@@ -205,6 +205,31 @@ CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode);
 `);
 
 // ============================================================
+// TABELA DE AUDITORIA — force-free de mesa (Ciclo 4 / AUD-ME-02)
+// Registra toda liberação forçada de mesa, com motivo e timestamp.
+// Criada de forma idempotente para não quebrar bancos existentes.
+// ============================================================
+db.exec(`
+  CREATE TABLE IF NOT EXISTS table_force_free_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    table_id INTEGER NOT NULL REFERENCES tables(id),
+    order_id INTEGER REFERENCES orders(id),
+    reason TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_table_force_free_table
+      ON table_force_free_log(table_id)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_table_force_free_table: ${e.message}`);
+}
+
+
+// ============================================================
 // MIGRAÇÕES — adiciona colunas em bancos antigos
 // ============================================================
 function columnExists(table, column) {

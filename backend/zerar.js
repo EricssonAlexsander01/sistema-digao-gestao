@@ -2,35 +2,47 @@ const db = require('./database');
 
 console.log('🧹 Zerando dados operacionais...');
 
-// 1. Apaga tudo dos dados operacionais
-db.exec(`
-  DELETE FROM order_items;
-  DELETE FROM payments;
-  DELETE FROM deliveries;
-  DELETE FROM driver_payments;
-  DELETE FROM orders;
-  DELETE FROM cash_movements;
-  DELETE FROM cash_registers;
-  DELETE FROM expenses;
-  DELETE FROM losses;
-`);
+// FIX Ciclo 4 / AUD-ME-02: incluir table_force_free_log antes de apagar
+// orders/tables (FK sem ON DELETE CASCADE).
+// Envolvido em transação: se uma etapa falhar, nada é apagado.
 
-// 2. Reseta os IDs autoincrementais
-db.exec(`
-  DELETE FROM sqlite_sequence WHERE name IN (
-    'orders','order_items','payments','deliveries','driver_payments',
-    'cash_registers','cash_movements','expenses','losses'
-  );
-`);
+const zerar = db.transaction(() => {
+  // 1. Auditoria primeiro (referencia orders e tables)
+  db.exec(`DELETE FROM table_force_free_log;`);
 
-// 3. Libera TODAS as mesas
-db.exec(`
-  UPDATE tables
-  SET status = 'LIVRE',
-      waiter_id = NULL,
-      opened_at = NULL,
-      closed_at = NULL;
-`);
+  // 2. Dados operacionais
+  db.exec(`
+    DELETE FROM order_items;
+    DELETE FROM payments;
+    DELETE FROM deliveries;
+    DELETE FROM driver_payments;
+    DELETE FROM orders;
+    DELETE FROM cash_movements;
+    DELETE FROM cash_registers;
+    DELETE FROM expenses;
+    DELETE FROM losses;
+  `);
+
+  // 3. Reseta os IDs autoincrementais
+  db.exec(`
+    DELETE FROM sqlite_sequence WHERE name IN (
+      'table_force_free_log',
+      'orders','order_items','payments','deliveries','driver_payments',
+      'cash_registers','cash_movements','expenses','losses'
+    );
+  `);
+
+  // 4. Libera TODAS as mesas
+  db.exec(`
+    UPDATE tables
+    SET status = 'LIVRE',
+        waiter_id = NULL,
+        opened_at = NULL,
+        closed_at = NULL;
+  `);
+});
+
+zerar();
 
 console.log('✅ Dados operacionais zerados. Cardápio e mesas mantidos.');
 console.log('✅ Todas as 25 mesas estão LIVRES.');

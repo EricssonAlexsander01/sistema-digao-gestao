@@ -15,6 +15,14 @@
 // + FIX Ciclo 2: POST /orders valida itens, consulta produto no banco,
 //   ignora name/price do payload (AUD-PD-01..05 / F-P) e executa
 //   order + order_items em transação atômica com nextNum interno.
+// + FIX Ciclo 3 / AUD-ME-07: (frontend) separação entre itens existentes
+//   e itens novos no PDV modo mesa.
+// + FIX Ciclo 4 / AUD-ME-02: force-free com motivo obrigatório, auditoria
+//   (table_force_free_log) e desvinculação do pedido (table_id = NULL).
+// + FIX Ciclo 4 / AUD-ME-05: nova rota PUT /tables/:id/waiter para trocar
+//   garçom sem alterar orders.waiter_id (histórico preservado).
+// + FIX Ciclo 4 / AUD-ME-06: getActiveOrderByTable nunca retorna pedido
+//   com financial_status = 'PAGO'.
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -44,12 +52,22 @@ function getOpenCashRegister() {
   ).get();
 }
 
+// FIX Ciclo 4 / AUD-ME-06: pedido financeiramente PAGO nunca é
+// tratado como pedido operacional ativo. Itera os candidatos e
+// devolve o primeiro cujo financial_status NÃO seja 'PAGO'.
 function getActiveOrderByTable(tableId) {
-  return db.prepare(`
+  const candidatos = db.prepare(`
     SELECT * FROM orders
     WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
-    ORDER BY id ASC LIMIT 1
-  `).get(tableId);
+    ORDER BY id ASC
+  `).all(tableId);
+
+  for (const pedido of candidatos) {
+    if (getOrderFinancialStatus(pedido.id) !== 'PAGO') {
+      return pedido;
+    }
+  }
+  return undefined;
 }
 
 function recalcularTotaisPedido(orderId) {
@@ -313,13 +331,102 @@ app.post('/api/tables/:id/close', (req, res) => {
   res.json({ ok: true });
 });
 
+// FIX Ciclo 4 / AUD-ME-02: force-free com motivo obrigatório,
+// auditoria e desvinculação do pedido operacional (table_id = NULL),
+// tudo em transação atômica.
 app.post('/api/tables/:id/force-free', (req, res) => {
+  const tableId = Number(req.params.id);
+  const { reason } = req.body || {};
+
+  // Validação do motivo (obrigatório, mínimo 3 caracteres não-brancos)
+  if (!reason || typeof reason !== 'string' || reason.trim().length < 3) {
+    return res.status(400).json({
+      error: 'RN030: Motivo obrigatório (mínimo 3 caracteres) para liberar a mesa à força.'
+    });
+  }
+  const motivoLimpo = reason.trim();
+
+  // Verifica se a mesa existe
+  const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(tableId);
+  if (!mesa) {
+    return res.status(404).json({ error: 'Mesa não encontrada' });
+  }
+
+  try {
+    const executar = db.transaction(() => {
+      // 1. Localiza pedido operacional vinculado (se houver)
+      const pedidoAtivo = db.prepare(`
+        SELECT * FROM orders
+        WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
+        ORDER BY id ASC LIMIT 1
+      `).get(tableId);
+
+      // 2. Desvincula o pedido (preserva histórico, não cancela)
+      if (pedidoAtivo) {
+        db.prepare(`
+          UPDATE orders
+          SET table_id = NULL, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(pedidoAtivo.id);
+      }
+
+      // 3. Libera a mesa
+      db.prepare(`
+        UPDATE tables
+        SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(tableId);
+
+      // 4. Registra auditoria
+      db.prepare(`
+        INSERT INTO table_force_free_log (table_id, order_id, reason)
+        VALUES (?, ?, ?)
+      `).run(tableId, pedidoAtivo ? pedidoAtivo.id : null, motivoLimpo);
+
+      return {
+        table_id: tableId,
+        order_desvinculado: pedidoAtivo ? pedidoAtivo.id : null,
+        reason: motivoLimpo
+      };
+    });
+
+    const resultado = executar();
+    res.json({ ok: true, ...resultado });
+
+  } catch (e) {
+    console.error('[force-free] erro na transação:', e);
+    res.status(500).json({ error: 'Erro ao liberar mesa à força' });
+  }
+});
+
+// FIX Ciclo 4 / AUD-ME-05: troca de garçom de uma mesa.
+// Altera SOMENTE tables.waiter_id. Preserva orders.waiter_id (histórico).
+app.put('/api/tables/:id/waiter', (req, res) => {
+  const tableId = Number(req.params.id);
+  const { waiter_id } = req.body || {};
+
+  const mesa = db.prepare('SELECT * FROM tables WHERE id = ?').get(tableId);
+  if (!mesa) {
+    return res.status(404).json({ error: 'Mesa não encontrada' });
+  }
+
+  const novoWaiterId = Number(waiter_id);
+  if (!Number.isInteger(novoWaiterId) || novoWaiterId <= 0) {
+    return res.status(400).json({ error: 'waiter_id inválido' });
+  }
+
+  const garcom = db.prepare('SELECT * FROM waiters WHERE id = ? AND active = 1').get(novoWaiterId);
+  if (!garcom) {
+    return res.status(400).json({ error: 'Garçom não encontrado ou inativo' });
+  }
+
   db.prepare(`
     UPDATE tables
-    SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
+    SET waiter_id = ?
     WHERE id = ?
-  `).run(req.params.id);
-  res.json({ ok: true });
+  `).run(novoWaiterId, tableId);
+
+  res.json({ ok: true, table_id: tableId, waiter_id: novoWaiterId, waiter_name: garcom.name });
 });
 
 // ============================================================
