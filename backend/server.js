@@ -1,10 +1,17 @@
 // server.js — API REST do Digão Gestão (Seção 23 do documento)
 // + Módulo de Mesas e Garçons
 // + Módulo de Impressão (Bematech MP-4200 TH)
-// + FIX Bug #1: 1 mesa = 1 pedido ativo (adiciona itens ao pedido existente)
+// + FIX Bug #1: 1 mesa = 1 pedido ativo
 // + Separação de estado OPERACIONAL vs FINANCEIRO
 // + FIX Bug #2: impressão automática para TODOS os canais
-// + FIX Bug #4: timezone local em todas as queries de data (16 ocorrências)
+// + FIX Bug #4: timezone local em todas as queries de data
+// + FIX Bug #2b: envio explícito para cozinha (só MESA)
+// + FIX v1.6.1: todo pagamento exige caixa aberto (RN017)
+// + FIX Ciclo 1 Etapa 2: helpers financeiros
+// + FIX Ciclo 1 Etapa 3: múltiplos pagamentos + saldo + transação atômica
+// + FIX Ciclo 1 Etapa 4: financial_status derivado em todas as consultas
+// + FIX Ciclo 1 Etapa 6: cash/close bloqueia com pendências financeiras
+// + FIX Ciclo 1 Etapa 8: cash/movement valida amount (RN027/RN028/RN029)
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -42,16 +49,6 @@ function getActiveOrderByTable(tableId) {
   `).get(tableId);
 }
 
-function getFinancialStatus(orderId) {
-  const p = db.prepare('SELECT 1 FROM payments WHERE order_id = ? LIMIT 1').get(orderId);
-  return p ? 'PAGO' : 'ABERTO';
-}
-
-function enrichOrder(order) {
-  if (!order) return order;
-  return { ...order, financial_status: getFinancialStatus(order.id) };
-}
-
 function recalcularTotaisPedido(orderId) {
   const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId);
   const subtotal = items.reduce((s, i) => s + (i.price * i.quantity), 0);
@@ -64,7 +61,6 @@ function recalcularTotaisPedido(orderId) {
   return { subtotal, delivery_fee: fee, total };
 }
 
-// FIX Bug #2b — busca itens pendentes de envio para cozinha (só MESA)
 function getPendingItems(orderId) {
   return db.prepare(`
     SELECT * FROM order_items
@@ -74,12 +70,53 @@ function getPendingItems(orderId) {
 }
 
 // ============================================================
+// HELPERS FINANCEIROS (Ciclo 1)
+// ============================================================
+
+function getOrderPaymentsTotal(orderId) {
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(amount), 0) AS total
+    FROM payments
+    WHERE order_id = ?
+  `).get(orderId);
+  return Number(row.total) || 0;
+}
+
+function getOrderRemaining(orderId) {
+  const order = db.prepare('SELECT total FROM orders WHERE id = ?').get(orderId);
+  if (!order) return 0;
+  const paid = getOrderPaymentsTotal(orderId);
+  const remaining = Number(order.total) - paid;
+  return remaining > 0 ? remaining : 0;
+}
+
+function getOrderFinancialStatus(orderId) {
+  const order = db.prepare('SELECT total FROM orders WHERE id = ?').get(orderId);
+  if (!order) return 'ABERTO';
+
+  const total = Number(order.total) || 0;
+  const paid = getOrderPaymentsTotal(orderId);
+
+  if (paid <= 0) return 'ABERTO';
+  if (Math.abs(paid - total) < 0.01 || paid > total) return 'PAGO';
+  return 'PARCIAL';
+}
+
+function enrichOrderFinancials(order) {
+  if (!order) return order;
+  order.financial_status = getOrderFinancialStatus(order.id);
+  order.payments_total = getOrderPaymentsTotal(order.id);
+  order.remaining = getOrderRemaining(order.id);
+  return order;
+}
+
+// ============================================================
 // ROTA RAIZ
 // ============================================================
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.6.0',
+    versao: '1.6.1',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
     modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão']
   });
@@ -214,7 +251,7 @@ app.get('/api/tables', (req, res) => {
     const order = getActiveOrderByTable(t.id);
     if (order) {
       order.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
-      order.financial_status = getFinancialStatus(order.id);
+      enrichOrderFinancials(order);
       t.open_order = order;
     } else {
       t.open_order = null;
@@ -292,7 +329,6 @@ app.get('/api/orders', (req, res) => {
   if (status) { sql += ' AND status = ?'; params.push(status); }
   if (channel) { sql += ' AND channel = ?'; params.push(channel); }
   if (table_id) { sql += ' AND table_id = ?'; params.push(table_id); }
-  // FIX Bug #4 (item #1): 'localtime' para respeitar fuso do usuário
   if (date) { sql += " AND date(created_at, 'localtime') = date(?)"; params.push(date); }
   sql += ' ORDER BY id DESC';
   if (limit) { sql += ' LIMIT ?'; params.push(Number(limit)); }
@@ -301,7 +337,7 @@ app.get('/api/orders', (req, res) => {
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
     o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
-    o.financial_status = o.payment ? 'PAGO' : 'ABERTO';
+    enrichOrderFinancials(o);
     if (o.table_id) {
       o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
     }
@@ -317,7 +353,7 @@ app.get('/api/orders/:id', (req, res) => {
   if (!o) return res.status(404).json({ error: 'Pedido não encontrado' });
   o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
   o.payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(o.id);
-  o.financial_status = o.payment ? 'PAGO' : 'ABERTO';
+  enrichOrderFinancials(o);
   if (o.table_id) {
     o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
   }
@@ -399,7 +435,9 @@ app.post('/api/orders', (req, res) => {
         ...totais,
         itensAdicionados: items.length,
         jaExistia: true,
-        financial_status: getFinancialStatus(pedidoExistente.id)
+        financial_status: getOrderFinancialStatus(pedidoExistente.id),
+        payments_total: getOrderPaymentsTotal(pedidoExistente.id),
+        remaining: getOrderRemaining(pedidoExistente.id)
       });
     }
   }
@@ -440,7 +478,9 @@ app.post('/api/orders', (req, res) => {
     delivery_fee: fee,
     total,
     jaExistia: false,
-    financial_status: 'ABERTO'
+    financial_status: 'ABERTO',
+    payments_total: 0,
+    remaining: total
   });
 });
 
@@ -453,10 +493,8 @@ app.put('/api/orders/:id', (req, res) => {
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado' });
 
   if (status === 'CANCELADO') {
-    const pago = db.prepare(
-      'SELECT 1 FROM payments WHERE order_id = ? LIMIT 1'
-    ).get(req.params.id);
-    if (pago) {
+    const total = getOrderPaymentsTotal(req.params.id);
+    if (total > 0) {
       return res.status(400).json({
         error: 'RN016: Pedido já possui pagamento registrado. Estorne o pagamento antes de cancelar.'
       });
@@ -473,35 +511,133 @@ app.put('/api/orders/:id', (req, res) => {
 // PAYMENTS
 // ============================================================
 app.post('/api/orders/:id/payment', (req, res) => {
-  const { method, amount, received } = req.body;
+  const body = req.body || {};
+  const { method, received } = body;
 
-  if (!method) return res.status(400).json({ error: 'RN002: Forma de pagamento obrigatória' });
+  if (!method) {
+    return res.status(400).json({ error: 'RN002: Forma de pagamento obrigatória' });
+  }
+
+  const METODOS_VALIDOS = ['PIX', 'DINHEIRO', 'DEBITO', 'CREDITO'];
+  if (!METODOS_VALIDOS.includes(method)) {
+    return res.status(400).json({ error: 'RN002: Forma de pagamento inválida' });
+  }
 
   const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
+  if (!order) {
+    return res.status(404).json({ error: 'Pedido não encontrado' });
+  }
 
-  const change = method === 'DINHEIRO' && received ? Number(received) - order.total : 0;
+  const register = getOpenCashRegister();
+  if (!register) {
+    return res.status(400).json({
+      error: 'RN017: Nenhum caixa aberto. Abra o caixa antes de registrar pagamentos.'
+    });
+  }
 
-  db.prepare(`
-    INSERT INTO payments (order_id, method, amount, received, change_amount)
-    VALUES (?,?,?,?,?)
-  `).run(order.id, method, amount || order.total, received || null, change);
+  if (order.cash_register_id == null) {
+    db.prepare('UPDATE orders SET cash_register_id = ? WHERE id = ?')
+      .run(register.id, order.id);
+    order.cash_register_id = register.id;
+  } else if (order.cash_register_id !== register.id) {
+    return res.status(400).json({
+      error: 'RN018: Este pedido pertence a outro caixa. Feche o pedido antes de abrir outro caixa.'
+    });
+  }
 
-  db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('EM PREPARO', order.id);
+  const saldoRestante = getOrderRemaining(order.id);
+
+  if (saldoRestante <= 0) {
+    return res.status(400).json({
+      error: 'RN019: Este pedido já está totalmente pago.'
+    });
+  }
+
+  const amountProvided =
+    body.amount !== undefined &&
+    body.amount !== null &&
+    body.amount !== '';
+
+  let amount;
+  if (amountProvided) {
+    amount = Number(body.amount);
+    if (!Number.isFinite(amount)) {
+      return res.status(400).json({ error: 'RN020: Valor do pagamento inválido.' });
+    }
+    if (amount <= 0) {
+      return res.status(400).json({ error: 'RN021: Valor do pagamento deve ser positivo.' });
+    }
+    if (amount > saldoRestante + 0.01) {
+      return res.status(400).json({
+        error: `RN022: Valor excede o saldo devedor (R$ ${saldoRestante.toFixed(2)}).`
+      });
+    }
+  } else {
+    amount = saldoRestante;
+  }
+
+  let change = 0;
+  let receivedValue = null;
+
+  if (method === 'DINHEIRO') {
+    if (received !== undefined && received !== null && received !== '') {
+      receivedValue = Number(received);
+      if (!Number.isFinite(receivedValue)) {
+        return res.status(400).json({ error: 'RN023: Valor recebido inválido.' });
+      }
+      if (receivedValue < amount) {
+        return res.status(400).json({ error: 'RN024: Valor recebido insuficiente.' });
+      }
+      change = receivedValue - amount;
+    }
+  }
+
+  let novoFinancialStatus = 'ABERTO';
+
+  try {
+    const tx = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO payments (order_id, method, amount, received, change_amount)
+        VALUES (?,?,?,?,?)
+      `).run(order.id, method, amount, receivedValue, change);
+
+      db.prepare(`
+        UPDATE orders SET status = 'EM PREPARO', updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(order.id);
+
+      if (method === 'DINHEIRO') {
+        db.prepare(`
+          INSERT INTO cash_movements (register_id, type, description, amount)
+          VALUES (?, 'VENDA', ?, ?)
+        `).run(register.id, `Pedido #${order.number} (Dinheiro)`, amount);
+      } else {
+        db.prepare(`
+          INSERT INTO cash_movements (register_id, type, description, amount)
+          VALUES (?, 'ENTRADA', ?, 0)
+        `).run(register.id, `Pedido #${order.number} (${method} — não físico)`);
+      }
+
+      novoFinancialStatus = getOrderFinancialStatus(order.id);
+    });
+
+    tx();
+  } catch (e) {
+    console.error('[payment] erro na transação:', e);
+    return res.status(500).json({ error: 'Erro ao registrar pagamento.' });
+  }
 
   if (order.table_id) {
-    const outrosSemPagamento = db.prepare(`
-      SELECT COUNT(*) AS n
-      FROM orders o
-      WHERE o.table_id = ?
-        AND o.id != ?
-        AND o.status NOT IN ('CONCLUIDO','CANCELADO')
-        AND NOT EXISTS (
-          SELECT 1 FROM payments p WHERE p.order_id = o.id
-        )
-    `).get(order.table_id, order.id).n;
+    const pedidosAtivos = db.prepare(`
+      SELECT id FROM orders
+      WHERE table_id = ? AND status NOT IN ('CONCLUIDO','CANCELADO')
+    `).all(order.table_id);
 
-    if (outrosSemPagamento === 0) {
+    const todosPagos = pedidosAtivos.every(p =>
+      getOrderFinancialStatus(p.id) === 'PAGO'
+    );
+
+    if (todosPagos) {
       db.prepare(`
         UPDATE tables
         SET status = 'LIVRE', waiter_id = NULL, closed_at = CURRENT_TIMESTAMP
@@ -510,11 +646,6 @@ app.post('/api/orders/:id/payment', (req, res) => {
     }
   }
 
-  // ============================================================
-  // FIX Bug #2 — Impressão automática no pagamento
-  // FIX Bug #2b — Para MESA, só imprime itens PENDENTES (fallback).
-  //              Para outros canais, mantém o comportamento anterior.
-  // ============================================================
   const mesaPgto = order.table_id
     ? db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id)
     : null;
@@ -523,7 +654,6 @@ app.post('/api/orders/:id/payment', (req, res) => {
     : null;
 
   if (order.channel === 'MESA') {
-    // Fallback: só imprime itens que ainda não foram enviados à cozinha
     const pendentes = getPendingItems(order.id);
     if (pendentes.length > 0) {
       printer.imprimirComanda(order, pendentes, mesaPgto, garcomPgto)
@@ -539,39 +669,24 @@ app.post('/api/orders/:id/payment', (req, res) => {
         .catch(e => console.error('[payment] erro ao imprimir fallback:', e));
     }
   } else {
-    // BALCAO / WHATSAPP / IFOOD — comportamento inalterado
     const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
     printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
       .catch(e => console.error('[payment] erro ao imprimir:', e));
   }
 
-  const register = getOpenCashRegister();
-  if (register) {
-    if (method === 'DINHEIRO') {
-      db.prepare(`
-        INSERT INTO cash_movements (register_id, type, description, amount)
-        VALUES (?, 'VENDA', ?, ?)
-      `).run(register.id, `Pedido #${order.number} (Dinheiro)`, order.total);
-    } else {
-      db.prepare(`
-        INSERT INTO cash_movements (register_id, type, description, amount)
-        VALUES (?, 'ENTRADA', ?, 0)
-      `).run(register.id, `Pedido #${order.number} (${method} — não físico)`);
-    }
-  }
-
-  res.json({ ok: true, change, method, financial_status: 'PAGO' });
+  res.json({
+    ok: true,
+    method,
+    amount,
+    received: receivedValue,
+    change,
+    financial_status: novoFinancialStatus,
+    remaining: getOrderRemaining(order.id)
+  });
 });
 
 // ============================================================
-// FIX Bug #2b — ENVIAR PARA COZINHA (só MESA)
-// Imprime itens PENDENTES e marca como ENVIADO após sucesso.
-//
-// LIMITAÇÃO DOCUMENTADA:
-//   A impressão física é "at-least-once". Se dois requests chegarem
-//   simultaneamente, ambos podem ver os mesmos itens como PENDENTES
-//   e imprimir duplicado. O sistema NÃO promete exactly-once.
-//   A conferência visual na cozinha resolve o caso excepcional.
+// SEND TO KITCHEN
 // ============================================================
 app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
   const orderId = Number(req.params.id);
@@ -604,7 +719,6 @@ app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
     ? db.prepare('SELECT * FROM waiters WHERE id = ?').get(order.waiter_id)
     : null;
 
-  // Impressão fora de qualquer transação
   let resultado;
   try {
     resultado = await printer.imprimirComanda(order, pendentes, mesa, garcom);
@@ -620,7 +734,6 @@ app.post('/api/orders/:id/send-to-kitchen', async (req, res) => {
     });
   }
 
-  // Só marca como ENVIADO após confirmação da impressão
   const ids = pendentes.map(i => i.id);
   const placeholders = ids.map(() => '?').join(',');
   db.prepare(`
@@ -644,7 +757,9 @@ app.get('/api/orders/:id/financial', (req, res) => {
   const payment = db.prepare('SELECT * FROM payments WHERE order_id = ?').get(req.params.id);
   res.json({
     order_id: Number(req.params.id),
-    financial_status: payment ? 'PAGO' : 'ABERTO',
+    financial_status: getOrderFinancialStatus(req.params.id),
+    payments_total: getOrderPaymentsTotal(req.params.id),
+    remaining: getOrderRemaining(req.params.id),
     payment: payment || null
   });
 });
@@ -703,7 +818,7 @@ app.get('/api/kitchen', (req, res) => {
   `).all();
   orders.forEach(o => {
     o.items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id);
-    o.financial_status = getFinancialStatus(o.id);
+    enrichOrderFinancials(o);
     if (o.table_id) {
       o.table = db.prepare('SELECT * FROM tables WHERE id = ?').get(o.table_id);
     }
@@ -773,6 +888,47 @@ app.post('/api/cash/close', (req, res) => {
     });
   }
 
+  const pendentesDoCaixa = db.prepare(`
+    SELECT id, number, total
+    FROM orders
+    WHERE cash_register_id = ?
+      AND status NOT IN ('CONCLUIDO','CANCELADO')
+  `).all(reg.id).filter(o => {
+    const fs = getOrderFinancialStatus(o.id);
+    return fs === 'ABERTO' || fs === 'PARCIAL';
+  });
+
+  const pendentesSemCaixa = db.prepare(`
+    SELECT id, number, total
+    FROM orders
+    WHERE cash_register_id IS NULL
+      AND status NOT IN ('CONCLUIDO','CANCELADO')
+  `).all().filter(o => {
+    const fs = getOrderFinancialStatus(o.id);
+    return fs === 'ABERTO' || fs === 'PARCIAL';
+  });
+
+  const totalPendentes = pendentesDoCaixa.length + pendentesSemCaixa.length;
+
+  if (totalPendentes > 0) {
+    const numerosDoCaixa = pendentesDoCaixa.map(o => `#${o.number}`).join(', ');
+    const numerosSemCaixa = pendentesSemCaixa.map(o => `#${o.number}`).join(', ');
+
+    const partes = [];
+    if (pendentesDoCaixa.length > 0) {
+      partes.push(`${pendentesDoCaixa.length} pedido(s) deste caixa (${numerosDoCaixa})`);
+    }
+    if (pendentesSemCaixa.length > 0) {
+      partes.push(`${pendentesSemCaixa.length} pedido(s) sem caixa associado (${numerosSemCaixa})`);
+    }
+
+    return res.status(400).json({
+      error: `RN026: Existem ${totalPendentes} pedido(s) com pagamento pendente. Resolva antes de fechar o caixa: ${partes.join(' e ')}.`,
+      pendentes_do_caixa: pendentesDoCaixa.map(o => ({ id: o.id, number: o.number, total: o.total })),
+      pendentes_sem_caixa: pendentesSemCaixa.map(o => ({ id: o.id, number: o.number, total: o.total }))
+    });
+  }
+
   const movements = db.prepare('SELECT * FROM cash_movements WHERE register_id = ?').all(reg.id);
   const sales = movements.filter(m => m.type === 'VENDA').reduce((s, m) => s + m.amount, 0);
   const entries = movements.filter(m => m.type === 'ENTRADA').reduce((s, m) => s + m.amount, 0);
@@ -790,15 +946,28 @@ app.post('/api/cash/close', (req, res) => {
   res.json({ expected, informed: Number(informed_value), difference: diff });
 });
 
+// FIX Ciclo 1 — RN027/RN028/RN029: validação de amount em movimentação manual
 app.post('/api/cash/movement', (req, res) => {
   const { type, description, amount } = req.body;
   const reg = getOpenCashRegister();
   if (!reg) return res.status(400).json({ error: 'Caixa fechado' });
   if (!['ENTRADA','SAIDA'].includes(type)) return res.status(400).json({ error: 'Tipo inválido' });
+
+  if (amount === undefined || amount === null || amount === '') {
+    return res.status(400).json({ error: 'RN027: Valor da movimentação obrigatório.' });
+  }
+  const num = Number(amount);
+  if (!Number.isFinite(num)) {
+    return res.status(400).json({ error: 'RN028: Valor da movimentação inválido.' });
+  }
+  if (num <= 0) {
+    return res.status(400).json({ error: 'RN029: Valor da movimentação deve ser positivo.' });
+  }
+
   db.prepare(`
     INSERT INTO cash_movements (register_id, type, description, amount)
     VALUES (?,?,?,?)
-  `).run(reg.id, type, description, amount);
+  `).run(reg.id, type, description, num);
   res.json({ ok: true });
 });
 
@@ -812,13 +981,11 @@ app.get('/api/cash/movements', (req, res) => {
 
 // ============================================================
 // EXPENSES / LOSSES
-// FIX Bug #4 — filtros com 'localtime'
 // ============================================================
 app.get('/api/expenses', (req, res) => {
   const { from, to } = req.query;
   let sql = 'SELECT * FROM expenses WHERE 1=1';
   const params = [];
-  // FIX Bug #4 (itens #6 e #7)
   if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
   if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
   sql += ' ORDER BY id DESC';
@@ -839,7 +1006,6 @@ app.get('/api/losses', (req, res) => {
   const { from, to } = req.query;
   let sql = 'SELECT * FROM losses WHERE 1=1';
   const params = [];
-  // FIX Bug #4 (itens #8 e #9)
   if (from) { sql += " AND date(created_at, 'localtime') >= date(?)"; params.push(from); }
   if (to)   { sql += " AND date(created_at, 'localtime') <= date(?)"; params.push(to); }
   sql += ' ORDER BY id DESC';
@@ -966,14 +1132,11 @@ app.post('/api/drivers/:id/pay', (req, res) => {
 
 // ============================================================
 // DASHBOARD
-// FIX Bug #4 — todas as queries com 'localtime'
 // ============================================================
 app.get('/api/dashboard', (req, res) => {
-  // FIX Bug #4a — calcular 'today' em horário LOCAL (não UTC)
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-  // FIX Bug #4 (item #2)
   const orders = db.prepare(`
     SELECT * FROM orders
     WHERE date(created_at, 'localtime') = date(?) AND status != 'CANCELADO'
@@ -985,19 +1148,16 @@ app.get('/api/dashboard', (req, res) => {
   const byChannel = (ch) =>
     orders.filter(o => o.channel === ch).reduce((s, o) => s + o.total, 0);
 
-  // FIX Bug #4 (item #3)
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
     WHERE date(created_at, 'localtime') = date(?)
   `).get(today).t;
 
-  // FIX Bug #4 (item #4)
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
     WHERE date(created_at, 'localtime') = date(?)
   `).get(today).t;
 
-  // FIX Bug #4 (item #5)
   const entregas = db.prepare(`
     SELECT COUNT(*) AS count, COALESCE(SUM(fee),0) AS total
     FROM deliveries WHERE date(created_at, 'localtime') = date(?)
@@ -1022,14 +1182,12 @@ app.get('/api/dashboard', (req, res) => {
 
 // ============================================================
 // RELATÓRIOS
-// FIX Bug #4 — todas as queries com 'localtime'
 // ============================================================
 app.get('/api/reports', (req, res) => {
   const { from, to } = req.query;
   const fromDate = from || '2000-01-01';
   const toDate = to || '2100-01-01';
 
-  // FIX Bug #4 (item #10)
   const orders = db.prepare(`
     SELECT * FROM orders
     WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
@@ -1039,7 +1197,6 @@ app.get('/api/reports', (req, res) => {
   const faturamento = orders.reduce((s, o) => s + o.total, 0);
   const ticket = orders.length ? faturamento / orders.length : 0;
 
-  // FIX Bug #4 (item #11)
   const byChannel = db.prepare(`
     SELECT channel, COUNT(*) AS count, COALESCE(SUM(total),0) AS total
     FROM orders
@@ -1048,7 +1205,6 @@ app.get('/api/reports', (req, res) => {
     GROUP BY channel
   `).all(fromDate, toDate);
 
-  // FIX Bug #4 (item #12)
   const byPayment = db.prepare(`
     SELECT p.method, COUNT(*) AS count, COALESCE(SUM(p.amount),0) AS total
     FROM payments p
@@ -1057,25 +1213,21 @@ app.get('/api/reports', (req, res) => {
     GROUP BY p.method
   `).all(fromDate, toDate);
 
-  // FIX Bug #4 (item #13)
   const expenses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM expenses
     WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
-  // FIX Bug #4 (item #14)
   const losses = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM losses
     WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
-  // FIX Bug #4 (item #15)
   const deliveries = db.prepare(`
     SELECT COUNT(*) AS count, COALESCE(SUM(fee),0) AS total
     FROM deliveries WHERE date(created_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate);
 
-  // FIX Bug #4 (item #16) — paid_at também
   const driverPayments = db.prepare(`
     SELECT COALESCE(SUM(amount),0) AS t FROM driver_payments
     WHERE date(paid_at, 'localtime') BETWEEN date(?) AND date(?)
@@ -1140,7 +1292,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.6.1');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');

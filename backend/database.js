@@ -1,6 +1,7 @@
 // database.js — Estrutura completa do banco (Seção 22 do documento)
 // + Módulo de MESAS e GARÇONS
 // + FIX Bug #2b: print_status em order_items (envio para cozinha, só MESA)
+// + FIX Ciclo 1 (AM3-B): orders.cash_register_id (associação pedido ↔ caixa)
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -216,7 +217,9 @@ const migrations = [
   ['orders',   'table_id',  'ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES tables(id)'],
   ['orders',   'waiter_id', 'ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)'],
   // FIX Bug #2b: estado de envio para cozinha (só MESA)
-  ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0']
+  ['order_items', 'print_status', 'ALTER TABLE order_items ADD COLUMN print_status INTEGER NOT NULL DEFAULT 0'],
+  // FIX Ciclo 1 (AM3-B): associação pedido ↔ caixa
+  ['orders', 'cash_register_id', 'ALTER TABLE orders ADD COLUMN cash_register_id INTEGER REFERENCES cash_registers(id)']
 ];
 
 migrations.forEach(([table, column, sql]) => {
@@ -238,6 +241,16 @@ try {
   `);
 } catch (e) {
   console.log(`⚠️  idx_order_items_print_status: ${e.message}`);
+}
+
+// FIX Ciclo 1 — índice para cash/close filtrar por caixa
+try {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_cash_register
+      ON orders(cash_register_id)
+  `);
+} catch (e) {
+  console.log(`⚠️  idx_orders_cash_register: ${e.message}`);
 }
 
 // ============================================================

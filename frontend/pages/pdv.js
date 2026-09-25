@@ -1,8 +1,8 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo PDV (com suporte a MESA)
    FIX Bug #1: 1 mesa = 1 pedido ativo.
-   FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render),
-   eliminando listener zumbi que reagia a cliques de outras telas.
+   FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render).
+   FIX Ciclo 1 Etapa 7: exibir saldo restante em modo MESA (parcial).
    ============================================================ */
 
 let produtosCache = [];
@@ -49,7 +49,6 @@ window.loadPDV = async function (container, params = {}) {
 
   // FIX Bug #6 — abre o modal de pagamento automaticamente quando
   // a URL traz ?pay=ID e o ID corresponde ao pedido ativo da mesa.
-  // Ignora silenciosamente se qualquer condição falhar.
   if (params.pay && mesaCtx && mesaCtx.open_order) {
     if (Number(params.pay) === mesaCtx.open_order.id) {
       abrirModalPagamentoMesa(mesaCtx.open_order);
@@ -185,13 +184,17 @@ function renderPDV() {
           </div>
         </div>
       </div>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;align-items:center">
         ${mesaCtx.open_order ? `
           <button class="btn btn-primary" id="btn-enviar-cozinha">
             <i class="fa-solid fa-fire"></i> Enviar para cozinha
           </button>
           <button class="btn btn-success" id="btn-fechar-conta">
-            <i class="fa-solid fa-money-bill"></i> Fechar conta (${Digao.money(mesaCtx.open_order.total)})
+            <i class="fa-solid fa-money-bill"></i>
+            Fechar conta (${Digao.money(mesaCtx.open_order.total)})
+            ${mesaCtx.open_order.financial_status === 'PARCIAL'
+              ? `<span style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;font-size:11px">PARCIAL · resta ${Digao.money(mesaCtx.open_order.remaining)}</span>`
+              : ''}
           </button>
         ` : ''}
         <button class="btn btn-secondary" id="btn-voltar-mesas">
@@ -357,7 +360,7 @@ function iconForCategory(cat, isAdditional) {
 // ============================================================
 function renderCarrinho() {
   const itemsEl = document.getElementById('cart-items');
-  if (!itemsEl) return;   // FIX Bug #8 — segurança: não quebra se tela foi trocada
+  if (!itemsEl) return;
   const cart = Digao.state.cart;
 
   if (cart.length === 0) {
@@ -455,15 +458,11 @@ function alterarQtd(index, delta) {
 
 // ============================================================
 // EVENTOS
-// FIX Bug #8 — todos os listeners vivem em #pdv-root (ou filhos),
-// que é recriado a cada render. Nenhum listener em #app-view.
 // ============================================================
 function bindPDVEvents() {
-  // FIX Bug #8 — root local, recriado a cada render.
   const root = document.getElementById('pdv-root');
   if (!root) return;
 
-  // ===== Botões do modo mesa =====
   root.querySelector('#btn-voltar-mesas')?.addEventListener('click', () => {
     location.hash = 'mesas';
   });
@@ -474,16 +473,13 @@ function bindPDVEvents() {
     }
   });
 
-  // FIX Bug #2b — botão "Enviar para cozinha"
   root.querySelector('#btn-enviar-cozinha')?.addEventListener('click', enviarParaCozinha);
 
-  // ===== Adicionar produto (delegado em #pdv-root) =====
   root.addEventListener('click', (e) => {
     const card = e.target.closest('.product-card');
     if (card) adicionarItem(card.dataset.id);
   });
 
-  // ===== Busca =====
   const searchInput = root.querySelector('#search-input');
   if (searchInput) {
     searchInput.addEventListener('input', (e) => {
@@ -492,7 +488,6 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Categorias =====
   const categories = root.querySelector('#categories');
   if (categories) {
     categories.addEventListener('click', (e) => {
@@ -505,7 +500,6 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Canal (só sem mesa) =====
   const channelToggle = root.querySelector('#channel-toggle');
   if (channelToggle) {
     channelToggle.addEventListener('click', (e) => {
@@ -527,7 +521,6 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Taxa de entrega =====
   const deliveryFee = root.querySelector('#delivery-fee');
   if (deliveryFee) {
     deliveryFee.addEventListener('input', (e) => {
@@ -536,7 +529,6 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Forma de pagamento =====
   const paymentMethods = root.querySelector('#payment-methods');
   if (paymentMethods) {
     paymentMethods.addEventListener('click', (e) => {
@@ -549,11 +541,9 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Valor recebido =====
   const valorRecebido = root.querySelector('#valor-recebido');
   if (valorRecebido) valorRecebido.addEventListener('input', renderCarrinho);
 
-  // ===== Carrinho +/− =====
   const cartItems = root.querySelector('#cart-items');
   if (cartItems) {
     cartItems.addEventListener('click', (e) => {
@@ -564,7 +554,6 @@ function bindPDVEvents() {
     });
   }
 
-  // ===== Confirmar venda =====
   const confirmBtn = root.querySelector('#confirm-btn');
   if (confirmBtn) confirmBtn.addEventListener('click', confirmarVenda);
 }
@@ -628,7 +617,6 @@ async function confirmarVenda() {
       const obsField = document.getElementById('order-observation');
       if (obsField) obsField.value = '';
 
-      // FIX Bug #2b — novos itens fazem o botão voltar a ficar habilitado
       await atualizarBotaoEnviarCozinha();
 
       return;
@@ -670,8 +658,11 @@ async function confirmarVenda() {
 
 // ============================================================
 // MODAL — FECHAR CONTA DA MESA
+// FIX Ciclo 1 Etapa 7: exibir parcial + usar remaining
 // ============================================================
 function abrirModalPagamentoMesa(order) {
+  const saldoDevido = order.remaining ?? order.total;
+
   const html = `
     <h3 style="margin-bottom:14px">Fechar conta — ${escapeHtml(mesaCtx.table_name)}</h3>
 
@@ -686,6 +677,17 @@ function abrirModalPagamentoMesa(order) {
         <span>TOTAL</span>
         <span style="color:var(--primary)">${Digao.money(order.total)}</span>
       </div>
+
+      ${order.financial_status === 'PARCIAL' ? `
+        <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;margin-top:8px;color:var(--success)">
+          <span>Já pago</span>
+          <strong>${Digao.money(order.payments_total)}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:15px;font-weight:800;padding-top:6px;color:var(--warning)">
+          <span>Saldo restante</span>
+          <span>${Digao.money(order.remaining)}</span>
+        </div>
+      ` : ''}
     </div>
 
     <div class="label">Forma de pagamento</div>
@@ -698,7 +700,7 @@ function abrirModalPagamentoMesa(order) {
 
     <div id="mesa-troco-wrap" style="margin-bottom:16px">
       <label class="label">Valor recebido (R$)</label>
-      <input class="input" type="number" id="mesa-recebido" step="0.01" min="0" value="${order.total.toFixed(2)}">
+      <input class="input" type="number" id="mesa-recebido" step="0.01" min="0" value="${saldoDevido.toFixed(2)}">
       <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">
         Troco: <strong id="mesa-troco" style="color:var(--success)">R$ 0,00</strong>
       </div>
@@ -721,7 +723,7 @@ function abrirModalPagamentoMesa(order) {
 
   function updateTroco() {
     const r = Number(recInput.value) || 0;
-    const t = r - order.total;
+    const t = r - saldoDevido;
     trocoEl.textContent = Digao.money(Math.max(t, 0));
     trocoEl.style.color = t >= 0 ? 'var(--success)' : 'var(--danger)';
   }
@@ -746,11 +748,11 @@ function abrirModalPagamentoMesa(order) {
   document.getElementById('mesa-pgto-cancel').addEventListener('click', () => m.close());
 
   document.getElementById('mesa-pgto-confirm').addEventListener('click', async () => {
-    const recebido = method === 'DINHEIRO' ? Number(recInput.value) || order.total : null;
+    const recebido = method === 'DINHEIRO' ? Number(recInput.value) || saldoDevido : null;
     try {
       await Digao.post(`/orders/${order.id}/payment`, {
         method,
-        amount: order.total,
+        amount: saldoDevido,
         received: recebido
       });
 
