@@ -1,5 +1,6 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Relatórios + Dashboard
+   FIX Ciclo 9 / BUG 2: seção "Vendas e estornos por método".
    ============================================================ */
 
 // ============================================================
@@ -8,9 +9,6 @@
 window.loadDashboard = async function (container) {
   const dash = await Digao.get('/dashboard');
   container.innerHTML = renderDashboard(dash);
-
-  // Gráfico simples (vendas por canal)
-  renderCanalChart(dash);
 };
 
 function renderDashboard(d) {
@@ -24,7 +22,6 @@ function renderDashboard(d) {
         <p style="font-size:12px;color:var(--text-muted);margin-top:4px">${Digao.date(d.data)}</p>
       </div>
 
-      <!-- KPI principal -->
       <div class="card" style="padding:26px;background:linear-gradient(135deg,rgba(251,191,36,0.12),transparent);border:1px solid rgba(251,191,36,0.3);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
         <div>
           <div style="font-size:12px;color:var(--primary);font-weight:700;letter-spacing:1px">FATURAMENTO HOJE</div>
@@ -42,7 +39,6 @@ function renderDashboard(d) {
         </div>
       </div>
 
-      <!-- KPIs secundários -->
       <div class="grid-4">
         <div class="card" style="padding:18px">
           <div style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px">BALCÃO</div>
@@ -63,7 +59,6 @@ function renderDashboard(d) {
         </div>
       </div>
 
-      <!-- Barra: distribuição por canal -->
       <div class="card" style="padding:20px">
         <h4 style="font-size:14px;font-weight:700;margin-bottom:16px">Distribuição por canal</h4>
         <div style="display:flex;height:28px;border-radius:6px;overflow:hidden;background:var(--bg-dark)">
@@ -78,7 +73,6 @@ function renderDashboard(d) {
         </div>
       </div>
 
-      <!-- Resultado -->
       <div class="grid-3">
         <div class="card" style="padding:18px">
           <div style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px">DESPESAS</div>
@@ -97,15 +91,12 @@ function renderDashboard(d) {
   `;
 }
 
-function renderCanalChart() { /* já incorporado na barra acima */ }
-
 // ============================================================
 // LOADER — RELATÓRIOS
 // ============================================================
 let relFiltro = { from: '', to: '' };
 
 window.loadRelatorios = async function (container) {
-  // Padrão: últimos 30 dias
   const today = new Date().toISOString().substring(0, 10);
   const past = new Date(Date.now() - 30 * 86400000).toISOString().substring(0, 10);
   relFiltro = { from: past, to: today };
@@ -119,7 +110,6 @@ function renderRelatoriosLayout() {
   return `
     <div class="page-padding" style="display:flex;flex-direction:column;gap:16px;overflow-y:auto">
 
-      <!-- Filtros -->
       <div class="card" style="padding:14px 18px;display:flex;gap:12px;align-items:end;flex-wrap:wrap">
         <div>
           <label class="label">De</label>
@@ -154,7 +144,6 @@ async function carregarRelatorios() {
   const r = await Digao.get('/reports?' + params.toString());
 
   el.innerHTML = `
-    <!-- KPIs principais -->
     <div class="grid-3" style="margin-bottom:16px">
       <div class="card" style="padding:20px">
         <div style="font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:0.5px">FATURAMENTO</div>
@@ -170,7 +159,6 @@ async function carregarRelatorios() {
       </div>
     </div>
 
-    <!-- Vendas por canal -->
     <div class="card" style="padding:20px;margin-bottom:16px">
       <h4 style="font-size:14px;font-weight:700;margin-bottom:14px">Vendas por canal</h4>
       ${r.byChannel.length === 0 ? '<p style="font-size:13px;color:var(--text-muted)">Sem dados no período.</p>' :
@@ -187,7 +175,6 @@ async function carregarRelatorios() {
       </div>`}
     </div>
 
-    <!-- Vendas por forma de pagamento -->
     <div class="card" style="padding:20px;margin-bottom:16px">
       <h4 style="font-size:14px;font-weight:700;margin-bottom:14px">Vendas por forma de pagamento</h4>
       ${r.byPayment.length === 0 ? '<p style="font-size:13px;color:var(--text-muted)">Sem dados no período.</p>' :
@@ -204,7 +191,8 @@ async function carregarRelatorios() {
       </div>`}
     </div>
 
-    <!-- Resumo financeiro -->
+    ${renderMetodoSection(r)}
+
     <div class="card" style="padding:20px">
       <h4 style="font-size:14px;font-weight:700;margin-bottom:14px">Resumo financeiro</h4>
       <div style="display:flex;flex-direction:column;gap:8px;font-size:13.5px">
@@ -239,13 +227,51 @@ async function carregarRelatorios() {
   `;
 }
 
+// FIX Ciclo 9 / BUG 2: vendas e estornos por método
+function renderMetodoSection(r) {
+  const sales = r.salesByMethod || [];
+  const refunds = r.refundsByMethod || [];
+  const methods = ['DINHEIRO', 'PIX', 'DEBITO', 'CREDITO'];
+
+  const linhas = methods.map(m => {
+    const s = sales.find(x => x.method === m) || { total: 0, count: 0 };
+    const ref = refunds.find(x => x.method === m) || { total: 0, count: 0 };
+    const liquido = Number(s.total) - Number(ref.total);
+    return { method: m, sales: Number(s.total), refunds: Number(ref.total), net: liquido };
+  }).filter(l => l.sales > 0 || l.refunds > 0);
+
+  if (linhas.length === 0) return '';
+
+  return `
+    <div class="card" style="padding:20px;margin-bottom:16px">
+      <h4 style="font-size:14px;font-weight:700;margin-bottom:14px">Vendas e estornos por método</h4>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">
+        ${linhas.map(l => `
+          <div style="padding:12px 14px;background:var(--bg-dark);border-radius:8px">
+            <div style="font-size:13px;font-weight:700;margin-bottom:6px">${formatPayment(l.method)}</div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:3px">
+              <span>Vendas</span>
+              <strong style="color:var(--success)">${Digao.money(l.sales)}</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:6px">
+              <span>Estornos</span>
+              <strong style="color:var(--warning)">${Digao.money(l.refunds)}</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding-top:6px;border-top:1px dashed var(--border);font-size:13px;font-weight:800">
+              <span>Líquido</span>
+              <strong style="color:var(--primary)">${Digao.money(l.net)}</strong>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
 function formatPayment(m) {
   return { DINHEIRO: '💵 Dinheiro', PIX: '⚡ Pix', DEBITO: '💳 Débito', CREDITO: '💳 Crédito' }[m] || m;
 }
 
-// ============================================================
-// EVENTOS
-// ============================================================
 function bindRelatoriosEvents() {
   document.getElementById('rel-aplicar').addEventListener('click', () => {
     relFiltro.from = document.getElementById('rel-from').value;

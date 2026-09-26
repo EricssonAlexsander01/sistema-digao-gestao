@@ -9,16 +9,20 @@
 // + FIX Ciclo 1: helpers financeiros, multi-pagamentos, saldo, cash/close
 // + FIX Ciclo 2 / AUD-PD-01..05: validação server-side de itens
 // + FIX Ciclo 3 / AUD-ME-07: separação itens existentes vs novos
-// + FIX Ciclo 4 / AUD-ME-02 / 05 / 06: force-free c/ auditoria, waiter, pedido PAGO inativo
+// + FIX Ciclo 4 / AUD-ME-02/05/06: force-free c/ auditoria, waiter, pedido PAGO inativo
 // + FIX Ciclo 5 / AUD-ARQ-01: order_items.is_additional + marcação em comanda
 // + FIX Ciclo 6 / AUD-PG-07: estorno (payments_refunds), financial_status ESTORNADO,
 //   cash_movements ESTORNO, endpoints de histórico de caixa
 // + FIX Ciclo 6 / BUG-D: expõe payments (plural) preservando payment (singular)
 // + FIX Ciclo 7 / AUTH: autenticação server-side com sessão + cookie HttpOnly.
-//   Toda rota é protegida por requireAuth/requireRole. Backend é a autoridade.
 // + FIX Ciclo 8 / DEC-05: soft delete em expenses/losses (active)
 // + FIX Ciclo 8 / RISCO-01: limite de 200 itens por pedido
 // + FIX Ciclo 8 / RISCO-02: bloqueia pagamento de CANCELADO/CONCLUIDO
+// + FIX Ciclo 9 / BUG 1: consolidação de order_items por print_status
+//   (chave: product_id + observation + is_additional)
+// + FIX Ciclo 9 / BUG 2: estorno espelha o método original do pagamento.
+//   DINHEIRO → cria cash_movement 'ESTORNO'
+//   PIX/DEBITO/CREDITO → apenas payments_refunds (não é físico)
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -340,7 +344,7 @@ app.put('/api/users/:id/password', auth.requireRole('admin'), (req, res) => {
 app.get('/api', (req, res) => {
   res.json({
     sistema: 'Digão Gestão',
-    versao: '1.8.0',
+    versao: '1.9.0',
     cliente: 'Digão Burger & Shawarma — Toledo/PR',
     modulos: ['PDV', 'Pedidos', 'WhatsApp', 'Cozinha', 'Caixa', 'Entregadores', 'Produtos', 'Financeiro', 'Relatórios', 'Mesas', 'Garçom', 'Impressão', 'Estorno', 'Usuários']
   });
@@ -668,7 +672,7 @@ app.get('/api/orders/:id', auth.requireAuth, (req, res) => {
 });
 
 // ============================================================
-// POST /api/orders — Ciclo 2 + Ciclo 8 (limite 200 itens)
+// POST /api/orders — Ciclo 2 + Ciclo 8 (limite) + Ciclo 9 (consolidação)
 // ============================================================
 app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) => {
   const {
@@ -686,7 +690,6 @@ app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) =
     return res.status(400).json({ error: 'RN001: Pedido precisa de pelo menos um produto' });
   }
 
-  // FIX Ciclo 8 / RISCO-01: limite de 200 itens por pedido
   if (items.length > 200) {
     return res.status(400).json({
       error: 'RN038: Pedido excede o limite de 200 itens.'
@@ -765,16 +768,43 @@ app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) =
             VALUES (?,?,?,?,?,?,0,?)
           `);
 
+          // FIX Ciclo 9 / BUG 1: consolidação determinística por chave
+          const findPendente = db.prepare(`
+            SELECT id, quantity FROM order_items
+            WHERE order_id = ?
+              AND product_id = ?
+              AND COALESCE(observation, '') = COALESCE(?, '')
+              AND is_additional = ?
+              AND print_status = 0
+            ORDER BY id DESC
+            LIMIT 1
+          `);
+
+          const somarQtd = db.prepare(`
+            UPDATE order_items SET quantity = quantity + ? WHERE id = ?
+          `);
+
           itensResolvidos.forEach(it => {
-            insertItem.run(
+            const pendente = findPendente.get(
               pedidoExistente.id,
               it.product_id,
-              it.name,
-              it.price,
-              it.quantity,
               it.observation,
               it.is_additional
             );
+
+            if (pendente) {
+              somarQtd.run(it.quantity, pendente.id);
+            } else {
+              insertItem.run(
+                pedidoExistente.id,
+                it.product_id,
+                it.name,
+                it.price,
+                it.quantity,
+                it.observation,
+                it.is_additional
+              );
+            }
           });
 
           if (observation) {
@@ -849,10 +879,6 @@ app.post('/api/orders', auth.requireRole('admin','caixa','garcom'), (req, res) =
   }
 });
 
-// ============================================================
-// PUT /api/orders/:id — Ciclo 8 (RISCO-02)
-// Bloqueia reversão de CANCELADO e CONCLUIDO
-// ============================================================
 app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'), (req, res) => {
   const { status } = req.body;
   const valid = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
@@ -861,16 +887,11 @@ app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'),
   const pedido = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado' });
 
-  // FIX Ciclo 8 / RISCO-02: estados finais não podem ser revertidos
   if (pedido.status === 'CANCELADO' && status !== 'CANCELADO') {
-    return res.status(400).json({
-      error: 'RN039: Pedido cancelado não pode ser reativado.'
-    });
+    return res.status(400).json({ error: 'RN039: Pedido cancelado não pode ser reativado.' });
   }
   if (pedido.status === 'CONCLUIDO' && status !== 'CONCLUIDO') {
-    return res.status(400).json({
-      error: 'RN040: Pedido concluído não pode ser revertido.'
-    });
+    return res.status(400).json({ error: 'RN040: Pedido concluído não pode ser revertido.' });
   }
 
   if (status === 'CANCELADO') {
@@ -889,7 +910,7 @@ app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'),
 });
 
 // ============================================================
-// PAYMENTS — Ciclo 8 (RISCO-02): bloqueia CANCELADO/CONCLUIDO
+// PAYMENTS
 // ============================================================
 app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res) => {
   const body = req.body || {};
@@ -909,16 +930,11 @@ app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res
     return res.status(404).json({ error: 'Pedido não encontrado' });
   }
 
-  // FIX Ciclo 8 / RISCO-02: bloqueia pagamento de estados finais
   if (order.status === 'CANCELADO') {
-    return res.status(400).json({
-      error: 'RN041: Pedido cancelado não pode receber pagamento.'
-    });
+    return res.status(400).json({ error: 'RN041: Pedido cancelado não pode receber pagamento.' });
   }
   if (order.status === 'CONCLUIDO') {
-    return res.status(400).json({
-      error: 'RN042: Pedido concluído não pode receber novo pagamento.'
-    });
+    return res.status(400).json({ error: 'RN042: Pedido concluído não pode receber novo pagamento.' });
   }
 
   const fsAtual = getOrderFinancialStatus(order.id);
@@ -1087,7 +1103,7 @@ app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res
 });
 
 // ============================================================
-// REFUND (Estorno) — somente admin
+// REFUND (Estorno) — Ciclo 6 + Ciclo 9 / BUG 2
 // ============================================================
 app.post('/api/orders/:id/refund', auth.requireRole('admin'), (req, res) => {
   const orderId = Number(req.params.id);
@@ -1151,7 +1167,7 @@ app.post('/api/orders/:id/refund', auth.requireRole('admin'), (req, res) => {
           err.status = 400;
           throw err;
         }
-        refunds.push({ payment_id: pid, amount: amt });
+        refunds.push({ payment_id: pid, amount: amt, method: payment.method });
       } else {
         const payments = db.prepare('SELECT * FROM payments WHERE order_id = ? ORDER BY id ASC').all(orderId);
         for (const p of payments) {
@@ -1159,7 +1175,7 @@ app.post('/api/orders/:id/refund', auth.requireRole('admin'), (req, res) => {
           const refundable = getPaymentRefundable(p.id);
           if (refundable <= 0) continue;
           const usar = Math.min(refundable, restante);
-          refunds.push({ payment_id: p.id, amount: Number(usar.toFixed(2)) });
+          refunds.push({ payment_id: p.id, amount: Number(usar.toFixed(2)), method: p.method });
           restante -= usar;
         }
         if (restante > 0.01) {
@@ -1175,10 +1191,20 @@ app.post('/api/orders/:id/refund', auth.requireRole('admin'), (req, res) => {
       `);
       refunds.forEach(r => insertRefund.run(r.payment_id, orderId, r.amount, motivoLimpo));
 
-      db.prepare(`
+      // FIX Ciclo 9 / BUG 2: cash_movement SOMENTE para DINHEIRO
+      const insertMovement = db.prepare(`
         INSERT INTO cash_movements (register_id, type, description, amount)
         VALUES (?, 'ESTORNO', ?, ?)
-      `).run(register.id, `Estorno Pedido #${order.number} — ${motivoLimpo}`, amt);
+      `);
+      refunds.forEach(r => {
+        if (r.method === 'DINHEIRO') {
+          insertMovement.run(
+            register.id,
+            `Estorno Pedido #${order.number} (Dinheiro) — ${motivoLimpo}`,
+            r.amount
+          );
+        }
+      });
 
       if (order.table_id) {
         const pedidosAtivos = db.prepare(`
@@ -1397,6 +1423,7 @@ app.post('/api/print/comanda/:id', auth.requireAuth, async (req, res) => {
   else res.status(500).json({ error: result.error });
 });
 
+
 // ============================================================
 // CASH REGISTER
 // ============================================================
@@ -1411,7 +1438,35 @@ app.get('/api/cash/current', auth.requireRole('admin','caixa'), (req, res) => {
   const exits = movements.filter(m => m.type === 'SAIDA').reduce((s, m) => s + m.amount, 0);
   const refunds = movements.filter(m => m.type === 'ESTORNO').reduce((s, m) => s + m.amount, 0);
   const current = reg.initial_value + sales + entries - exits - refunds;
-  res.json({ ...reg, movements, sales, entries, exits, refunds, current });
+
+  // FIX Ciclo 9 / BUG 2: movimentos por método (informativo)
+  const movementsByMethod = db.prepare(`
+    SELECT p.method,
+           COALESCE(SUM(p.amount), 0) AS total
+    FROM payments p
+    JOIN orders o ON o.id = p.order_id
+    WHERE o.cash_register_id = ?
+    GROUP BY p.method
+  `).all(reg.id);
+
+  const refundsByMethod = db.prepare(`
+    SELECT p.method,
+           COALESCE(SUM(pr.amount), 0) AS total
+    FROM payments_refunds pr
+    JOIN payments p ON p.id = pr.payment_id
+    JOIN orders o ON o.id = pr.order_id
+    WHERE o.cash_register_id = ?
+    GROUP BY p.method
+  `).all(reg.id);
+
+  res.json({
+    ...reg,
+    movements,
+    sales, entries, exits, refunds,
+    current,
+    movementsByMethod,
+    refundsByMethod
+  });
 });
 
 app.post('/api/cash/open', auth.requireRole('admin','caixa'), (req, res) => {
@@ -1596,7 +1651,6 @@ app.get('/api/cash/:id', auth.requireRole('admin','caixa'), (req, res) => {
 
 // ============================================================
 // EXPENSES / LOSSES
-// FIX Ciclo 8 / DEC-05: soft delete (coluna active)
 // ============================================================
 app.get('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to, show_inactive } = req.query;
@@ -1622,7 +1676,6 @@ app.post('/api/expenses', auth.requireRole('admin','caixa'), (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-// FIX Ciclo 8 / DEC-05: soft delete
 app.delete('/api/expenses/:id', auth.requireRole('admin','caixa'), (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
@@ -1633,7 +1686,6 @@ app.delete('/api/expenses/:id', auth.requireRole('admin','caixa'), (req, res) =>
   res.json({ ok: true, id, active: 0 });
 });
 
-// FIX Ciclo 8 / DEC-05: reativar
 app.put('/api/expenses/:id/reactivate', auth.requireRole('admin','caixa'), (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(id);
@@ -1668,7 +1720,6 @@ app.post('/api/losses', auth.requireRole('admin','caixa'), (req, res) => {
   res.json({ id: r.lastInsertRowid });
 });
 
-// FIX Ciclo 8 / DEC-05: soft delete
 app.delete('/api/losses/:id', auth.requireRole('admin','caixa'), (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM losses WHERE id = ?').get(id);
@@ -1679,7 +1730,6 @@ app.delete('/api/losses/:id', auth.requireRole('admin','caixa'), (req, res) => {
   res.json({ ok: true, id, active: 0 });
 });
 
-// FIX Ciclo 8 / DEC-05: reativar
 app.put('/api/losses/:id/reactivate', auth.requireRole('admin','caixa'), (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM losses WHERE id = ?').get(id);
@@ -1799,7 +1849,7 @@ app.post('/api/drivers/:id/pay', auth.requireRole('admin','caixa'), (req, res) =
 });
 
 // ============================================================
-// DASHBOARD — FIX Ciclo 8 / DEC-05: só lançamentos ativos
+// DASHBOARD
 // ============================================================
 app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
   const now = new Date();
@@ -1849,7 +1899,7 @@ app.get('/api/dashboard', auth.requireRole('admin','caixa'), (req, res) => {
 });
 
 // ============================================================
-// RELATÓRIOS — FIX Ciclo 8 / DEC-05: só lançamentos ativos
+// RELATÓRIOS — FIX Ciclo 9 / BUG 2: salesByMethod + refundsByMethod
 // ============================================================
 app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
   const { from, to } = req.query;
@@ -1901,6 +1951,27 @@ app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
     WHERE date(paid_at, 'localtime') BETWEEN date(?) AND date(?)
   `).get(fromDate, toDate).t;
 
+  // FIX Ciclo 9 / BUG 2: vendas e estornos por método
+  const salesByMethod = db.prepare(`
+    SELECT p.method,
+           COUNT(*) AS count,
+           COALESCE(SUM(p.amount), 0) AS total
+    FROM payments p
+    JOIN orders o ON o.id = p.order_id
+    WHERE date(o.created_at, 'localtime') BETWEEN date(?) AND date(?)
+    GROUP BY p.method
+  `).all(fromDate, toDate);
+
+  const refundsByMethod = db.prepare(`
+    SELECT p.method,
+           COUNT(*) AS count,
+           COALESCE(SUM(pr.amount), 0) AS total
+    FROM payments_refunds pr
+    JOIN payments p ON p.id = pr.payment_id
+    WHERE date(pr.created_at, 'localtime') BETWEEN date(?) AND date(?)
+    GROUP BY p.method
+  `).all(fromDate, toDate);
+
   res.json({
     periodo: { from: fromDate, to: toDate },
     faturamento,
@@ -1913,7 +1984,9 @@ app.get('/api/reports', auth.requireRole('admin','caixa'), (req, res) => {
     deliveries_count: deliveries.count,
     deliveries_total: deliveries.total,
     driver_payments: driverPayments,
-    resultado: faturamento - expenses - losses - deliveries.total
+    resultado: faturamento - expenses - losses - deliveries.total,
+    salesByMethod,
+    refundsByMethod
   });
 });
 
@@ -1960,7 +2033,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
   console.log('');
   console.log('================================================');
-  console.log('   🍔  DIGÃO GESTÃO — API REST v1.8.0');
+  console.log('   🍔  DIGÃO GESTÃO — API REST v1.9.0');
   console.log('================================================');
   console.log(`   💻 Neste computador:  http://localhost:${PORT}`);
   console.log('');

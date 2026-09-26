@@ -3,10 +3,10 @@
    FIX Bug #1: 1 mesa = 1 pedido ativo.
    FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render).
    FIX Ciclo 1 Etapa 7: exibir saldo restante em modo MESA (parcial).
-   FIX Ciclo 3 / AUD-ME-07: separação entre itens já existentes no
-     pedido do servidor (is_existing: true) e itens adicionados na
-     sessão atual (is_existing: false). No modo MESA com pedido já
-     aberto, somente os itens novos são enviados ao backend.
+   FIX Ciclo 3 / AUD-ME-07: separação itens existentes vs novos.
+   FIX Ciclo 9 / BUG 1: consolidação determinística (product_id + observation + is_additional).
+     - Botão "+" em item existente cria nova linha is_existing:false.
+     - Botão "-" em item existente é bloqueado (mensagem operacional).
    ============================================================ */
 
 let produtosCache = [];
@@ -14,17 +14,14 @@ let categoriasCache = [];
 let filtroCategoria = 'Todos';
 let filtroBusca = '';
 
-// Contexto de mesa (preenchido pelo roteador via ?table=X)
 let mesaCtx = null;
 
 // ============================================================
 // LOADER PRINCIPAL
 // ============================================================
 window.loadPDV = async function (container, params = {}) {
-  // Reset do contexto de mesa
   mesaCtx = null;
 
-  // Se veio ?table=X, carrega o contexto da mesa
   if (params.table) {
     await carregarContextoMesa(params.table);
   }
@@ -34,7 +31,6 @@ window.loadPDV = async function (container, params = {}) {
     Digao.get('/categories')
   ]);
 
-  // Reset do estado
   Digao.state.cart = [];
   Digao.state.channel = mesaCtx ? 'MESA' : 'BALCAO';
   Digao.state.paymentMethod = 'PIX';
@@ -43,7 +39,6 @@ window.loadPDV = async function (container, params = {}) {
   container.innerHTML = renderPDV();
   bindPDVEvents();
 
-  // Se a mesa já tem pedido aberto, carrega os itens no carrinho
   if (mesaCtx && mesaCtx.open_order) {
     carregarItensDoPedidoAberto(mesaCtx.open_order);
   }
@@ -51,15 +46,12 @@ window.loadPDV = async function (container, params = {}) {
   renderProdutos();
   renderCarrinho();
 
-  // FIX Bug #6 — abre o modal de pagamento automaticamente quando
-  // a URL traz ?pay=ID e o ID corresponde ao pedido ativo da mesa.
   if (params.pay && mesaCtx && mesaCtx.open_order) {
     if (Number(params.pay) === mesaCtx.open_order.id) {
       abrirModalPagamentoMesa(mesaCtx.open_order);
     }
   }
 
-  // FIX Bug #2b — atualiza o botão "Enviar para cozinha" após carregar
   if (mesaCtx) {
     await atualizarBotaoEnviarCozinha();
   }
@@ -93,9 +85,8 @@ async function carregarContextoMesa(tableId) {
   }
 }
 
-// FIX Ciclo 3 / AUD-ME-07: itens vindos do servidor são marcados
-// com is_existing: true, para que possam ser distinguidos dos itens
-// adicionados na sessão atual (is_existing: false).
+// FIX Ciclo 3 / AUD-ME-07: itens do servidor marcados com is_existing: true.
+// FIX Ciclo 9 / BUG 1: adiciona is_additional para agrupamento coerente.
 function carregarItensDoPedidoAberto(order) {
   Digao.state.cart = order.items.map(it => ({
     product_id: it.product_id,
@@ -103,11 +94,11 @@ function carregarItensDoPedidoAberto(order) {
     price: it.price,
     quantity: it.quantity,
     observation: it.observation || '',
+    is_additional: it.is_additional || 0,
     is_existing: true
   }));
 }
 
-// FIX Bug #2b — atualiza o estado visual do botão "Enviar para cozinha"
 async function atualizarBotaoEnviarCozinha() {
   const btn = document.getElementById('btn-enviar-cozinha');
   if (!btn) return;
@@ -137,7 +128,6 @@ async function atualizarBotaoEnviarCozinha() {
   }
 }
 
-// FIX Bug #2b — envia itens pendentes para a cozinha
 async function enviarParaCozinha() {
   if (!mesaCtx || !mesaCtx.open_order) return;
 
@@ -175,7 +165,6 @@ async function enviarParaCozinha() {
 
 // ============================================================
 // RENDER — estrutura da tela
-// FIX Bug #8 — todo o HTML é envolvido em #pdv-root.
 // ============================================================
 function renderPDV() {
   const bannerMesa = mesaCtx ? `
@@ -382,8 +371,8 @@ function renderCarrinho() {
     itemsEl.innerHTML = cart.map((item, i) => `
       <div class="cart-item" data-index="${i}">
         <div class="cart-item-info">
-          <h4>${escapeHtml(item.name)}</h4>
-          <span>${Digao.money(item.price)} un.</span>
+          <h4>${escapeHtml(item.name)}${item.is_additional ? ' <span style="color:var(--primary);font-weight:500;font-size:11px">(adicional)</span>' : ''}</h4>
+          <span>${Digao.money(item.price)} un.${item.is_existing ? ' · <span style="color:var(--text-dim)">já lançado</span>' : ''}</span>
           ${item.observation ? `<div class="cart-item-obs">Obs: ${escapeHtml(item.observation)}</div>` : ''}
         </div>
         <div class="cart-item-qty">
@@ -431,15 +420,6 @@ function renderCarrinho() {
 
 // ============================================================
 // AÇÕES
-// FIX Ciclo 3 / AUD-ME-07: separação entre itens já existentes no
-// servidor (is_existing: true) e novos itens da sessão (false).
-//
-// Regras:
-//  - item já existente no servidor NUNCA é alterado; ao tocar no
-//    produto de novo, cria-se uma NOVA linha com is_existing: false;
-//  - itens novos da sessão (is_existing: false) somam quantidade
-//    entre si quando o mesmo produto é adicionado várias vezes;
-//  - itens com observação sempre entram como linha separada.
 // ============================================================
 function adicionarItem(produtoId) {
   const prod = produtosCache.find(p => p.id === Number(produtoId));
@@ -447,12 +427,13 @@ function adicionarItem(produtoId) {
 
   const cart = Digao.state.cart;
 
-  // Procura SOMENTE em itens novos da sessão (is_existing === false)
-  // com o mesmo product_id e sem observação — só esses podem somar.
+  // FIX Ciclo 9 / BUG 1: chave de equivalência coerente com o backend
+  // product_id + observation + is_additional (apenas itens novos da sessão)
   const novoExistente = cart.find(i =>
     i.is_existing === false &&
     i.product_id === prod.id &&
-    !i.observation
+    !i.observation &&
+    (i.is_additional || 0) === (prod.is_additional ? 1 : 0)
   );
 
   if (novoExistente) {
@@ -464,6 +445,7 @@ function adicionarItem(produtoId) {
       price: prod.price,
       quantity: 1,
       observation: '',
+      is_additional: prod.is_additional ? 1 : 0,
       is_existing: false
     });
   }
@@ -473,9 +455,44 @@ function adicionarItem(produtoId) {
 
 function alterarQtd(index, delta) {
   const cart = Digao.state.cart;
-  if (!cart[index]) return;
-  cart[index].quantity += delta;
-  if (cart[index].quantity <= 0) {
+  const item = cart[index];
+  if (!item) return;
+
+  // FIX Ciclo 9 / BUG 1: +1 em item EXISTENTE vira nova linha (is_existing: false)
+  if (delta === 1 && item.is_existing === true) {
+    const novoExistente = cart.find(i =>
+      i.is_existing === false &&
+      i.product_id === item.product_id &&
+      (i.observation || '') === (item.observation || '') &&
+      (i.is_additional || 0) === (item.is_additional || 0)
+    );
+
+    if (novoExistente) {
+      novoExistente.quantity++;
+    } else {
+      cart.push({
+        product_id: item.product_id,
+        name: item.name,
+        price: item.price,
+        quantity: 1,
+        observation: item.observation || '',
+        is_additional: item.is_additional || 0,
+        is_existing: false
+      });
+    }
+    renderCarrinho();
+    return;
+  }
+
+  // FIX Ciclo 9 / BUG 1: -1 em item histórico é bloqueado
+  if (delta === -1 && item.is_existing === true) {
+    Digao.toast('Itens já lançados não podem ser reduzidos. Para corrigir, utilize o fluxo de cancelamento/ajuste.', 'warning', 4000);
+    return;
+  }
+
+  // Item novo da sessão → +/- normal
+  item.quantity += delta;
+  if (item.quantity <= 0) {
     cart.splice(index, 1);
   }
   renderCarrinho();
@@ -585,17 +602,11 @@ function bindPDVEvents() {
 
 // ============================================================
 // CONFIRMAR VENDA
-// FIX Ciclo 3 / AUD-ME-07: no fluxo MESA com pedido existente,
-// envia SOMENTE os itens novos da sessão (is_existing === false).
-// Se nenhum item novo foi adicionado, apenas recarrega e avisa.
-// Nos fluxos BALCÃO/WHATSAPP o carrinho começa vazio e todos os
-// itens são is_existing === false, então o comportamento é o mesmo.
 // ============================================================
 async function confirmarVenda() {
   const cart = Digao.state.cart;
   if (cart.length === 0) return;
 
-  // No fluxo MESA, precisamos garantir que existam itens novos.
   const isMesa = !!mesaCtx;
   const itensParaEnviar = isMesa
     ? cart.filter(i => i.is_existing === false)
@@ -638,7 +649,6 @@ async function confirmarVenda() {
 
     const order = await Digao.post('/orders', payload);
 
-    // ===== FLUXO MESA =====
     if (isMesa) {
       const msg = order.jaExistia
         ? `${mesaCtx.table_name}: +${order.itensAdicionados} ${order.itensAdicionados === 1 ? 'item' : 'itens'} na comanda #${Digao.pad(order.number)}`
@@ -661,7 +671,6 @@ async function confirmarVenda() {
       return;
     }
 
-    // ===== FLUXO BALCÃO / WHATSAPP =====
     const recebido = Digao.state.paymentMethod === 'DINHEIRO'
       ? Number(document.getElementById('valor-recebido').value) || order.total
       : null;
@@ -697,7 +706,6 @@ async function confirmarVenda() {
 
 // ============================================================
 // MODAL — FECHAR CONTA DA MESA
-// FIX Ciclo 1 Etapa 7: exibir parcial + usar remaining
 // ============================================================
 function abrirModalPagamentoMesa(order) {
   const saldoDevido = order.remaining ?? order.total;
