@@ -2,13 +2,31 @@
    DIGÃO GESTÃO — Módulo Pedidos (com envio para entrega)
    FIX Ciclo 5 / AUD-ARQ-01: modal de detalhes marca adicionais.
    FIX Ciclo 5 / AUD-ENT-01: modal de envio permite editar taxa.
-   FIX Ciclo 6 / BUG-D: modal de detalhes agora lista TODOS os
-     pagamentos (plural). Fallback para payment (singular) caso
-     o backend antigo seja acessado.
+   FIX Ciclo 6 / BUG-D: modal de detalhes lista TODOS os pagamentos.
+   FIX Ciclo 10 / AUTZ: ações por role via Digao.can.
+   FIX Ciclo 10.1 / PEDIDOS 5.1: reformulação de UX.
+     - Card com 5 linhas (identidade, contexto, itens, financeiro, ações).
+     - Situação financeira explícita: Total / Pago / Falta.
+     - Ações contextuais por status/canal/role.
+     - Busca por número/cliente.
+     - Filtros: status, situação, canal, data.
+     - Contadores segmentados.
+     - Modal de detalhes com contexto de mesa/garçom.
+     - Botão "Registrar pagamento" para ABERTO/PARCIAL.
+     - Status por <select> respeitando a matriz.
+     - Impressão renomeada para "Imprimir cupom (A4)".
+     - Estados loading/erro/vazio explícitos.
    ============================================================ */
 
-let pedidosFiltro = { status: '', channel: '', date: '' };
+let pedidosFiltro = {
+  status: '',
+  situacao: '',       // '', 'pendentes', 'pagas'
+  channel: '',
+  date: '',
+  busca: ''           // client-side
+};
 let driversCache = [];
+let pedidosCache = [];
 
 // ============================================================
 // LOADER PRINCIPAL
@@ -26,34 +44,46 @@ window.loadPedidos = async function (container) {
 // ============================================================
 function renderPedidosLayout() {
   return `
-    <div class="page-padding" style="display:flex;flex-direction:column;gap:16px;overflow:hidden">
+    <div class="page-padding" style="display:flex;flex-direction:column;gap:14px;overflow:hidden">
 
       <div class="card" style="padding:14px 18px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
-        <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:200px">
-          <i class="fa-solid fa-filter" style="color:var(--text-muted)"></i>
-          <select class="select" id="f-status" style="max-width:180px">
-            <option value="">Todos os status</option>
-            <option value="NOVO">Novo</option>
-            <option value="EM PREPARO">Em preparo</option>
-            <option value="PRONTO">Pronto</option>
-            <option value="EM ROTA">Em rota</option>
-            <option value="CONCLUIDO">Concluído</option>
-            <option value="CANCELADO">Cancelado</option>
-          </select>
-          <select class="select" id="f-channel" style="max-width:160px">
-            <option value="">Todos os canais</option>
-            <option value="BALCAO">Balcão</option>
-            <option value="WHATSAPP">WhatsApp</option>
-            <option value="IFOOD">iFood</option>
-          </select>
-          <input class="input" type="date" id="f-date" style="max-width:170px">
+        <div style="position:relative;flex:1;min-width:220px;max-width:320px">
+          <i class="fa-solid fa-magnifying-glass" style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text-muted);font-size:12px"></i>
+          <input class="input" id="f-busca" placeholder="Buscar por # ou cliente..." style="padding-left:34px">
         </div>
-        <div style="font-size:12px;color:var(--text-muted)">
-          <strong id="total-pedidos" style="color:var(--primary)">0</strong> pedidos
-        </div>
+        <select class="select" id="f-status" style="max-width:160px">
+          <option value="">Todos os status</option>
+          <option value="NOVO">Novo</option>
+          <option value="EM PREPARO">Em preparo</option>
+          <option value="PRONTO">Pronto</option>
+          <option value="EM ROTA">Em rota</option>
+          <option value="CONCLUIDO">Concluído</option>
+          <option value="CANCELADO">Cancelado</option>
+        </select>
+        <select class="select" id="f-situacao" style="max-width:160px">
+          <option value="">Toda situação</option>
+          <option value="pendentes">Pendentes</option>
+          <option value="pagas">Pagas</option>
+        </select>
+        <select class="select" id="f-channel" style="max-width:160px">
+          <option value="">Todos os canais</option>
+          <option value="BALCAO">Balcão</option>
+          <option value="WHATSAPP">WhatsApp</option>
+          <option value="IFOOD">iFood</option>
+          <option value="MESA">Mesa</option>
+        </select>
+        <input class="input" type="date" id="f-date" style="max-width:160px">
         <button class="btn btn-secondary" id="btn-refresh">
           <i class="fa-solid fa-rotate"></i> Atualizar
         </button>
+      </div>
+
+      <div id="pedidos-contadores" style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);padding:0 4px">
+        <span>Pendentes: <strong id="ct-pendentes" style="color:var(--warning)">0</strong></span>
+        <span>Em preparo: <strong id="ct-preparo" style="color:var(--info)">0</strong></span>
+        <span>Prontos: <strong id="ct-prontos" style="color:var(--success)">0</strong></span>
+        <span>Em rota: <strong id="ct-rota" style="color:var(--primary)">0</strong></span>
+        <span>Total: <strong id="ct-total" style="color:var(--text-main)">0</strong></span>
       </div>
 
       <div id="pedidos-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px"></div>
@@ -66,17 +96,75 @@ function renderPedidosLayout() {
 // ============================================================
 async function carregarPedidos() {
   const list = document.getElementById('pedidos-list');
-  list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Carregando…</div>';
+  list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)"><i class="fa-solid fa-spinner fa-spin"></i> Carregando…</div>';
 
-  const params = new URLSearchParams();
-  if (pedidosFiltro.status) params.set('status', pedidosFiltro.status);
-  if (pedidosFiltro.channel) params.set('channel', pedidosFiltro.channel);
-  if (pedidosFiltro.date) params.set('date', pedidosFiltro.date);
+  try {
+    const params = new URLSearchParams();
+    if (pedidosFiltro.status) params.set('status', pedidosFiltro.status);
+    if (pedidosFiltro.channel) params.set('channel', pedidosFiltro.channel);
+    if (pedidosFiltro.date) params.set('date', pedidosFiltro.date);
 
-  const pedidos = await Digao.get('/orders?' + params.toString());
-  document.getElementById('total-pedidos').textContent = pedidos.length;
+    pedidosCache = await Digao.get('/orders?' + params.toString());
+  } catch (e) {
+    list.innerHTML = `
+      <div class="card" style="text-align:center;padding:50px;color:var(--danger)">
+        <i class="fa-solid fa-triangle-exclamation" style="font-size:36px;opacity:0.6;display:block;margin-bottom:12px"></i>
+        Não foi possível carregar os pedidos. Tente novamente.
+      </div>
+    `;
+    return;
+  }
 
-  if (pedidos.length === 0) {
+  renderListaPedidos();
+}
+
+function aplicarFiltrosClientSide(lista) {
+  let out = lista;
+
+  if (pedidosFiltro.situacao === 'pendentes') {
+    out = out.filter(p => p.financial_status === 'ABERTO' || p.financial_status === 'PARCIAL');
+  } else if (pedidosFiltro.situacao === 'pagas') {
+    out = out.filter(p => p.financial_status === 'PAGO');
+  }
+
+  const busca = (pedidosFiltro.busca || '').trim().toLowerCase();
+  if (busca) {
+    const alvo = busca.replace(/^#?0*/, '');
+    out = out.filter(p => {
+      const num = String(p.number);
+      const numPadded = String(p.number).padStart(3, '0');
+      const nome = (p.customer_name || '').toLowerCase();
+      return num === alvo
+        || numPadded === busca
+        || num.includes(alvo)
+        || nome.includes(busca);
+    });
+  }
+
+  return out;
+}
+
+function renderContadores() {
+  const base = pedidosCache;
+  const pendentes = base.filter(p => p.financial_status === 'ABERTO' || p.financial_status === 'PARCIAL').length;
+  const preparo = base.filter(p => p.status === 'EM PREPARO').length;
+  const prontos = base.filter(p => p.status === 'PRONTO').length;
+  const rota = base.filter(p => p.status === 'EM ROTA').length;
+
+  document.getElementById('ct-pendentes').textContent = pendentes;
+  document.getElementById('ct-preparo').textContent = preparo;
+  document.getElementById('ct-prontos').textContent = prontos;
+  document.getElementById('ct-rota').textContent = rota;
+  document.getElementById('ct-total').textContent = base.length;
+}
+
+function renderListaPedidos() {
+  const list = document.getElementById('pedidos-list');
+  const filtrados = aplicarFiltrosClientSide(pedidosCache);
+
+  renderContadores();
+
+  if (filtrados.length === 0) {
     list.innerHTML = `
       <div class="card" style="text-align:center;padding:50px;color:var(--text-muted)">
         <i class="fa-solid fa-receipt" style="font-size:40px;opacity:0.3;display:block;margin-bottom:14px"></i>
@@ -86,47 +174,146 @@ async function carregarPedidos() {
     return;
   }
 
-  list.innerHTML = pedidos.map(p => renderPedidoCard(p)).join('');
+  list.innerHTML = filtrados.map(p => renderPedidoCard(p)).join('');
 }
 
+// ============================================================
+// CARD
+// ============================================================
 function renderPedidoCard(p) {
   const statusClass = statusColorClass(p.status);
-  const podeEnviar = ['PRONTO', 'EM PREPARO', 'NOVO'].includes(p.status);
+  const total = Number(p.total) || 0;
+  const pago = Number(p.payments_total) || 0;
+  const falta = Number(p.remaining) || 0;
+  const fs = p.financial_status || 'ABERTO';
+
+  // Canal amigável
+  let canalLabel = '';
+  if (p.channel === 'MESA') {
+    canalLabel = p.table ? `Mesa ${String(p.table.number).padStart(2, '0')}` : 'Mesa';
+  } else if (p.channel === 'WHATSAPP') {
+    canalLabel = p.customer_address ? 'WhatsApp · Entrega' : 'WhatsApp · Retirada';
+  } else if (p.channel === 'IFOOD') {
+    canalLabel = 'iFood';
+  } else {
+    canalLabel = 'Balcão';
+  }
+
+  // Contexto (linha 2)
+  const contexto = renderContexto(p);
+
+  // Horário HH:MM
+  const hora = formatHora(p.created_at);
+
+  // Ação primária
+  const acao = renderAcaoPrimaria(p);
+
+  // Financeiro (linha 4)
+  const financeiro = renderFinanceiro(p, total, pago, falta, fs);
 
   return `
-    <div class="card" style="padding:14px 18px;display:grid;grid-template-columns:80px 1fr auto auto;gap:16px;align-items:center" data-order-id="${p.id}">
-      <div>
-        <div style="font-size:11px;color:var(--text-muted);font-weight:600">PEDIDO</div>
-        <div style="font-size:20px;font-weight:800;color:var(--primary);letter-spacing:-0.5px">
-          #${Digao.pad(p.number)}
-        </div>
-      </div>
-      <div style="min-width:0;cursor:pointer" data-action="detalhes">
-        <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+    <div class="card" style="padding:14px 18px;display:flex;flex-direction:column;gap:8px" data-order-id="${p.id}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-size:20px;font-weight:800;color:var(--primary);letter-spacing:-0.5px">#${Digao.pad(p.number)}</span>
+          <span class="badge badge-channel" style="text-transform:none">${escapeHtml(canalLabel)}</span>
           <span class="badge ${statusClass}">${p.status}</span>
-          <span class="badge badge-channel">
-            ${p.channel === 'WHATSAPP' ? '<i class="fa-brands fa-whatsapp"></i> WhatsApp' : p.channel === 'IFOOD' ? 'iFood' : '<i class="fa-solid fa-store"></i> Balcão'}
-          </span>
-          <span style="font-size:11.5px;color:var(--text-muted)">${Digao.date(p.created_at)}</span>
+          ${fs === 'PARCIAL' ? `<span class="badge badge-warning">PARCIAL</span>` : ''}
         </div>
-        <div style="font-size:12.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-          ${p.items.map(i => `${i.quantity}x ${escapeHtml(i.name)}`).join(' · ')}
+        <span style="font-size:12px;color:var(--text-muted);font-weight:600">${hora}</span>
+      </div>
+
+      ${contexto ? `
+        <div style="font-size:12px;color:var(--text-muted);display:flex;gap:10px;flex-wrap:wrap">
+          ${contexto}
         </div>
+      ` : ''}
+
+      <div style="font-size:12.5px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+        ${p.items.map(i => `${i.quantity}x ${escapeHtml(i.name)}`).join(' · ')}
       </div>
-      <div style="text-align:right">
-        <div style="font-size:11px;color:var(--text-muted)">TOTAL</div>
-        <div style="font-size:17px;font-weight:800;color:var(--primary)">${Digao.money(p.total)}</div>
+
+      <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;font-size:12.5px;padding-top:4px;border-top:1px dashed var(--border)">
+        ${financeiro}
       </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        ${podeEnviar ? `
-          <button class="btn btn-primary" data-action="enviar" data-id="${p.id}" style="padding:8px 12px;font-size:12px">
-            <i class="fa-solid fa-motorcycle"></i> Enviar
-          </button>
-        ` : ''}
-        <i class="fa-solid fa-chevron-right" style="color:var(--text-dim);cursor:pointer" data-action="detalhes"></i>
+
+      ${acao ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">${acao}</div>` : ''}
+
+      <div style="display:flex;justify-content:flex-end;margin-top:-4px">
+        <i class="fa-solid fa-chevron-right" data-action="detalhes" style="color:var(--text-dim);cursor:pointer;padding:4px"></i>
       </div>
     </div>
   `;
+}
+
+function renderContexto(p) {
+  if (p.channel === 'MESA') {
+    const mesa = p.table ? `Mesa ${String(p.table.number).padStart(2, '0')}` : null;
+    const garcom = p.waiter ? p.waiter.name : (p.waiter_id ? '(garçom)' : null);
+    return [mesa, garcom].filter(Boolean).map(escapeHtml).join(' · ');
+  }
+  if (p.channel === 'WHATSAPP' || p.channel === 'IFOOD') {
+    const partes = [];
+    if (p.customer_name) partes.push(escapeHtml(p.customer_name));
+    if (p.customer_phone) partes.push(escapeHtml(p.customer_phone));
+    if (p.customer_address) {
+      partes.push(escapeHtml(p.customer_address));
+      if (p.customer_neighborhood) partes.push(escapeHtml(p.customer_neighborhood));
+    }
+    return partes.join(' · ');
+  }
+  return '';
+}
+
+function renderFinanceiro(p, total, pago, falta, fs) {
+  if (fs === 'PAGO') {
+    return `
+      <span style="color:var(--text-muted)">Total <strong style="color:var(--text-main)">${Digao.money(total)}</strong></span>
+      <span class="badge badge-success" style="font-size:11px">✓ Pago</span>
+    `;
+  }
+  if (fs === 'ESTORNADO') {
+    return `
+      <span style="color:var(--text-muted)">Total <strong style="color:var(--text-main)">${Digao.money(total)}</strong></span>
+      <span class="badge badge-danger" style="font-size:11px">Estornado</span>
+    `;
+  }
+  // ABERTO ou PARCIAL
+  return `
+    <span style="color:var(--text-muted)">Total <strong style="color:var(--text-main)">${Digao.money(total)}</strong></span>
+    <span style="color:var(--text-muted)">Pago <strong style="color:var(--success)">${Digao.money(pago)}</strong></span>
+    <span style="color:var(--text-muted)">Falta <strong style="color:var(--warning)">${Digao.money(falta)}</strong></span>
+  `;
+}
+
+function renderAcaoPrimaria(p) {
+  const botoes = [];
+
+  // Registrar pagamento
+  const podePagar = (p.financial_status === 'ABERTO' || p.financial_status === 'PARCIAL')
+    && Digao.can('pdv.pagar');
+  if (podePagar) {
+    const label = p.financial_status === 'PARCIAL'
+      ? `Registrar pagamento (falta ${Digao.money(p.remaining)})`
+      : `Registrar pagamento (${Digao.money(p.total)})`;
+    botoes.push(`
+      <button class="btn btn-success" data-action="pagar" data-id="${p.id}" style="padding:8px 12px;font-size:12px">
+        <i class="fa-solid fa-money-bill"></i> ${label}
+      </button>
+    `);
+  }
+
+  // Enviar para entrega
+  const podeEnviar = p.status === 'PRONTO' && p.channel !== 'MESA';
+  if (podeEnviar) {
+    botoes.push(`
+      <button class="btn btn-primary" data-action="enviar" data-id="${p.id}" style="padding:8px 12px;font-size:12px">
+        <i class="fa-solid fa-motorcycle"></i> Enviar para entrega
+      </button>
+    `);
+  }
+
+  return botoes.join('');
 }
 
 function statusColorClass(status) {
@@ -141,6 +328,12 @@ function statusColorClass(status) {
   return map[status] || 'badge-muted';
 }
 
+function formatHora(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.replace(' ', 'T') + 'Z');
+  return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+}
+
 // ============================================================
 // EVENTOS
 // ============================================================
@@ -148,6 +341,10 @@ function bindPedidosEvents() {
   document.getElementById('f-status').addEventListener('change', (e) => {
     pedidosFiltro.status = e.target.value;
     carregarPedidos();
+  });
+  document.getElementById('f-situacao').addEventListener('change', (e) => {
+    pedidosFiltro.situacao = e.target.value;
+    renderListaPedidos();
   });
   document.getElementById('f-channel').addEventListener('change', (e) => {
     pedidosFiltro.channel = e.target.value;
@@ -157,6 +354,13 @@ function bindPedidosEvents() {
     pedidosFiltro.date = e.target.value;
     carregarPedidos();
   });
+  const buscaInput = document.getElementById('f-busca');
+  if (buscaInput) {
+    buscaInput.addEventListener('input', (e) => {
+      pedidosFiltro.busca = e.target.value;
+      renderListaPedidos();
+    });
+  }
   document.getElementById('btn-refresh').addEventListener('click', carregarPedidos);
 
   document.getElementById('pedidos-list').addEventListener('click', (e) => {
@@ -167,12 +371,33 @@ function bindPedidosEvents() {
       return;
     }
 
+    const btnPagar = e.target.closest('[data-action="pagar"]');
+    if (btnPagar) {
+      e.stopPropagation();
+      abrirPagamentoPedido(Number(btnPagar.dataset.id));
+      return;
+    }
+
     const card = e.target.closest('[data-order-id]');
-    const detalhes = e.target.closest('[data-action="detalhes"]');
-    if (card && detalhes) {
+    if (card) {
       abrirDetalhesPedido(Number(card.dataset.orderId));
     }
   });
+}
+
+// ============================================================
+// PAGAMENTO DIRETO DO CARD
+// ============================================================
+async function abrirPagamentoPedido(orderId) {
+  try {
+    const order = await Digao.get(`/orders/${orderId}`);
+    Digao.abrirModalPagamento(order, {
+      title: `Pedido #${Digao.pad(order.number)} — pagamento`,
+      onClose: () => {
+        carregarPedidos();
+      }
+    });
+  } catch (e) { /* Digao.api já avisa */ }
 }
 
 // ============================================================
@@ -319,34 +544,62 @@ function abrirModalEnvio(orderId) {
 }
 
 // ============================================================
-// DETALHES DO PEDIDO
-// FIX Ciclo 5 / AUD-ARQ-01: marca adicionais
-// FIX Ciclo 6 / BUG-D: lista TODOS os pagamentos
+// MODAL — DETALHES DO PEDIDO
 // ============================================================
 async function abrirDetalhesPedido(id) {
-  const order = await Digao.get(`/orders/${id}`);
-  const comanda = await Digao.get(`/orders/${id}/comanda`);
+  let order, comanda;
+  try {
+    order = await Digao.get(`/orders/${id}`);
+    comanda = await Digao.get(`/orders/${id}/comanda`);
+  } catch (e) {
+    return;
+  }
 
-  const statusOptions = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
+  const statusOptions = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO']
+    .filter(s => Digao.can(`pedido.transicao.${s}`));
 
-  // BUG-D: usa payments (plural) com fallback para payment (singular)
   const payments = Array.isArray(order.payments) ? order.payments : (order.payment ? [order.payment] : []);
   const refunds = Array.isArray(order.refunds) ? order.refunds : [];
 
+  const total = Number(order.total) || 0;
+  const pago = Number(order.payments_total) || 0;
+  const falta = Number(order.remaining) || 0;
+  const fs = order.financial_status || 'ABERTO';
+
+  const canalLabel = order.channel === 'MESA'
+    ? 'Mesa'
+    : order.channel === 'WHATSAPP'
+      ? (order.customer_address ? 'WhatsApp · Entrega' : 'WhatsApp · Retirada')
+      : order.channel === 'IFOOD' ? 'iFood' : 'Balcão';
+
+  const podePagar = (fs === 'ABERTO' || fs === 'PARCIAL') && Digao.can('pdv.pagar');
+
   const html = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;gap:12px;flex-wrap:wrap">
       <div>
         <h3 style="margin:0">Pedido #${Digao.pad(order.number)}</h3>
-        <p style="font-size:12px;color:var(--text-muted);margin-top:4px">${Digao.date(order.created_at)}</p>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+          <span class="badge badge-channel" style="text-transform:none">${escapeHtml(canalLabel)}</span>
+          <span class="badge ${statusColorClass(order.status)}">${order.status}</span>
+          ${fs === 'PARCIAL' ? `<span class="badge badge-warning">PARCIAL</span>` : ''}
+          ${fs === 'PAGO' ? `<span class="badge badge-success">PAGO</span>` : ''}
+          ${fs === 'ESTORNADO' ? `<span class="badge badge-danger">ESTORNADO</span>` : ''}
+        </div>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:6px">${Digao.date(order.created_at)}</p>
       </div>
-      <span class="badge ${statusColorClass(order.status)}">${order.status}</span>
     </div>
 
     <div style="background:var(--bg-dark);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12.5px">
-      <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-        <span style="color:var(--text-muted)">Canal</span>
-        <strong>${order.channel}</strong>
-      </div>
+      ${order.channel === 'MESA' ? `
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+          <span style="color:var(--text-muted)">Mesa</span>
+          <strong>${order.table ? 'Mesa ' + String(order.table.number).padStart(2, '0') : '—'}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between">
+          <span style="color:var(--text-muted)">Garçom</span>
+          <strong>${order.waiter ? escapeHtml(order.waiter.name) : '—'}</strong>
+        </div>
+      ` : ''}
       ${order.customer_name ? `
         <div style="display:flex;justify-content:space-between;margin-bottom:6px">
           <span style="color:var(--text-muted)">Cliente</span>
@@ -356,10 +609,12 @@ async function abrirDetalhesPedido(id) {
           <span style="color:var(--text-muted)">Telefone</span>
           <strong>${escapeHtml(order.customer_phone || '—')}</strong>
         </div>
-        <div style="display:flex;justify-content:space-between">
-          <span style="color:var(--text-muted)">Endereço</span>
-          <strong style="text-align:right;max-width:60%">${escapeHtml(order.customer_address || '—')} ${escapeHtml(order.customer_neighborhood || '')}</strong>
-        </div>
+        ${order.customer_address ? `
+          <div style="display:flex;justify-content:space-between">
+            <span style="color:var(--text-muted)">Endereço</span>
+            <strong style="text-align:right;max-width:60%">${escapeHtml(order.customer_address)} ${escapeHtml(order.customer_neighborhood || '')}${order.customer_complement ? ' · ' + escapeHtml(order.customer_complement) : ''}</strong>
+          </div>
+        ` : ''}
       ` : ''}
     </div>
 
@@ -387,8 +642,25 @@ async function abrirDetalhesPedido(id) {
           <span>Taxa de entrega</span><span>${Digao.money(order.delivery_fee)}</span>
         </div>` : ''}
       <div style="display:flex;justify-content:space-between;padding-top:8px;border-top:1px dashed var(--border);font-weight:800;font-size:15px">
-        <span>Total</span><span style="color:var(--primary)">${Digao.money(order.total)}</span>
+        <span>Total</span><span style="color:var(--primary)">${Digao.money(total)}</span>
       </div>
+
+      ${fs === 'PAGO' ? `
+        <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:14px;color:var(--success);font-weight:700">
+          <span>✓ Pago</span><span>${Digao.money(total)}</span>
+        </div>
+      ` : fs === 'ESTORNADO' ? `
+        <div style="margin-top:10px;padding:8px 10px;background:rgba(245,158,11,0.12);border-radius:6px;font-size:12px;color:var(--warning);text-align:center;font-weight:700">
+          Pedido totalmente estornado
+        </div>
+      ` : `
+        <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:13px;color:var(--text-muted)">
+          <span>Pago</span><strong style="color:var(--success)">${Digao.money(pago)}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:15px;font-weight:800">
+          <span>FALTA</span><strong style="color:var(--warning)">${Digao.money(falta)}</strong>
+        </div>
+      `}
 
       ${payments.length > 0 ? `
         <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
@@ -399,38 +671,49 @@ async function abrirDetalhesPedido(id) {
               <strong style="color:var(--text-main)">${Digao.money(p.amount)}</strong>
             </div>
           `).join('')}
-          ${refunds.length > 0 ? `
-            <div style="font-size:11px;color:var(--warning);font-weight:600;margin-top:10px;margin-bottom:6px">ESTORNOS (${refunds.length})</div>
-            ${refunds.map(r => `
-              <div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--warning)">
-                <span>${escapeHtml(r.reason)}</span>
-                <strong>− ${Digao.money(r.amount)}</strong>
-              </div>
-            `).join('')}
-          ` : ''}
         </div>
       ` : ''}
 
-      ${order.financial_status === 'ESTORNADO' ? `
-        <div style="margin-top:10px;padding:8px 10px;background:rgba(245,158,11,0.12);border-radius:6px;font-size:12px;color:var(--warning);text-align:center;font-weight:700">
-          Pedido totalmente estornado
+      ${refunds.length > 0 ? `
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--warning);font-weight:600;margin-bottom:6px">ESTORNOS (${refunds.length})</div>
+          ${refunds.map(r => `
+            <div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0;color:var(--warning)">
+              <span>${escapeHtml(r.reason)}</span>
+              <strong>− ${Digao.money(r.amount)}</strong>
+            </div>
+          `).join('')}
         </div>
       ` : ''}
     </div>
 
-    <div style="margin-bottom:14px">
-      <label class="label">Alterar status</label>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        ${statusOptions.map(s => `
-          <button class="btn ${s === order.status ? 'btn-primary' : 'btn-secondary'} btn-status" data-status="${s}" style="padding:6px 12px;font-size:11.5px">${s}</button>
-        `).join('')}
+    ${podePagar ? `
+      <div style="margin-bottom:14px">
+        <button class="btn btn-success btn-block" id="btn-registrar-pagamento">
+          <i class="fa-solid fa-money-bill"></i>
+          ${fs === 'PARCIAL'
+            ? `Registrar pagamento restante (${Digao.money(falta)})`
+            : `Registrar pagamento (${Digao.money(total)})`}
+        </button>
       </div>
-    </div>
+    ` : ''}
+
+    ${statusOptions.length > 0 ? `
+      <div style="margin-bottom:14px">
+        <label class="label">Alterar status</label>
+        <select class="select" id="select-status">
+          ${statusOptions.map(s => `<option value="${s}" ${s === order.status ? 'selected' : ''}>${s}</option>`).join('')}
+        </select>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:6px">
+          Status atual: <strong>${order.status}</strong>
+        </div>
+      </div>
+    ` : ''}
 
     <div class="modal-actions">
       <button class="btn btn-secondary" id="close-modal">Fechar</button>
-      <button class="btn btn-primary" id="print-modal">
-        <i class="fa-solid fa-print"></i> Imprimir
+      <button class="btn btn-secondary" id="print-modal">
+        <i class="fa-solid fa-print"></i> Imprimir cupom (A4)
       </button>
     </div>
   `;
@@ -448,14 +731,32 @@ async function abrirDetalhesPedido(id) {
     setTimeout(() => w.close(), 500);
   });
 
-  m.overlay.querySelectorAll('.btn-status').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      await Digao.put(`/orders/${order.id}`, { status: btn.dataset.status });
-      Digao.toast('Status atualizado', 'success');
-      m.close();
-      carregarPedidos();
+  document.getElementById('btn-registrar-pagamento')?.addEventListener('click', async () => {
+    const atual = await Digao.get(`/orders/${order.id}`);
+    Digao.abrirModalPagamento(atual, {
+      title: `Pedido #${Digao.pad(atual.number)} — pagamento`,
+      onClose: () => {
+        m.close();
+        carregarPedidos();
+      }
     });
   });
+
+  const selectStatus = document.getElementById('select-status');
+  if (selectStatus) {
+    selectStatus.addEventListener('change', async (e) => {
+      const novo = e.target.value;
+      if (novo === order.status) return;
+      try {
+        await Digao.put(`/orders/${order.id}`, { status: novo });
+        Digao.toast('Status atualizado', 'success');
+        m.close();
+        carregarPedidos();
+      } catch (err) {
+        e.target.value = order.status;
+      }
+    });
+  }
 }
 
 // ============================================================

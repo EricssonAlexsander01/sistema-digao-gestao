@@ -4,12 +4,25 @@
    FIX Ciclo 7 / AUTH: trata 401 automaticamente, identifica
    usuário logado, esconde menus incompatíveis com a role e
    adiciona logout.
+   FIX Ciclo 10.1 / MODAL: Digao.abrirModalPagamento compartilhado.
    ============================================================ */
 
 // ============================================================
 // CONFIGURAÇÃO
 // ============================================================
 const API = '/api';
+
+// Helper local para escapar HTML em templates de modal/UI do próprio app.js.
+// Não é exposto em window.
+function escapeHtmlDigao(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
 // ============================================================
 // UTILITÁRIOS GLOBAIS
@@ -94,6 +107,280 @@ window.Digao = {
     }
     root.appendChild(overlay);
     return { close, overlay };
+  },
+
+  // ---------- AUTORIZAÇÃO (UI) ----------
+  // Espelha a matriz de política do backend. A autoridade real é o backend;
+  // este helper serve para esconder/mostrar ações na UI de forma consistente.
+  // Fecha por padrão: ação não listada ou role não autorizada → false.
+  _permissoes: {
+    'pdv.pagar':                   ['admin','caixa'],
+    'pdv.fecharConta':             ['admin','caixa'],
+    'whatsapp.pagar':              ['admin','caixa'],
+    'mesa.fecharConta':            ['admin','caixa'],
+    'mesa.trocarGarcom':           ['admin','garcom'],
+    'mesa.forceFree':              ['admin'],
+    'pedido.transicao.NOVO':       ['admin','caixa'],
+    'pedido.transicao.EM PREPARO': ['admin','caixa','cozinha'],
+    'pedido.transicao.PRONTO':     ['admin','caixa','cozinha'],
+    'pedido.transicao.EM ROTA':    ['admin','caixa'],
+    'pedido.transicao.CONCLUIDO':  ['admin','caixa'],
+    'pedido.transicao.CANCELADO':  ['admin','caixa'],
+    'caixa.estornar':              ['admin'],
+    'entregador.cadastrar':        ['admin'],
+    'entregador.editar':           ['admin'],
+    'entregador.ativar':           ['admin'],
+    'entregador.pagar':            ['admin','caixa']
+  },
+
+  can(action, role) {
+    if (!action) return false;
+    const alvo = role || Digao.state?.user?.role;
+    if (!alvo) return false;
+    const permitidos = Digao._permissoes[action];
+    if (!permitidos) return false;
+    return permitidos.includes(alvo);
+  },
+
+  // ---------- MODAL DE PAGAMENTO (compartilhado) ----------
+  // Cópia fiel da lógica que vivia em pages/pdv.js (abrirModalPagamentoMesa).
+  // Aceita qualquer order (MESA, BALCAO, WHATSAPP). Suporta múltiplos pagamentos,
+  // permanece aberto enquanto houver saldo, nenhum método pré-selecionado.
+  //
+  // opts aceitos:
+  //   - title           → título exibido no topo
+  //   - onClose({ quitado, ordem }) → chamado ao fechar (Concluir, Fechar/Pagar depois ou auto-fechamento)
+  //   - autoCloseOnPaid → se true, fecha automaticamente ~1,5s após quitar
+  abrirModalPagamento(order, opts = {}) {
+    const renderConteudo = (ordem) => {
+      const total = Number(ordem.total) || 0;
+      const pago = Number(ordem.payments_total) || 0;
+      const restante = Number(ordem.remaining) || 0;
+      const pagamentos = ordem.payments || [];
+      const saldoDevido = restante > 0 ? restante : total;
+
+      const linhasItens = (ordem.items || []).map(it => `
+        <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0">
+          <span><strong>${it.quantity}x</strong> ${escapeHtmlDigao(it.name)}</span>
+          <strong style="color:var(--primary)">${Digao.money(it.price * it.quantity)}</strong>
+        </div>
+      `).join('');
+
+      const linhasPagamentos = pagamentos.length === 0
+        ? '<div style="font-size:12px;color:var(--text-muted);text-align:center;padding:8px">Nenhum pagamento registrado ainda.</div>'
+        : pagamentos.map(p => `
+            <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0">
+              <span>${escapeHtmlDigao(p.method)}</span>
+              <strong style="color:var(--success)">${Digao.money(p.amount)}</strong>
+            </div>
+          `).join('');
+
+      const totalLabel = restante <= 0
+        ? `<div style="display:flex;justify-content:space-between;font-size:17px;font-weight:800;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);color:var(--success)">
+             <span>PAGO</span><span>${Digao.money(total)}</span>
+           </div>`
+        : `
+          <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--text-muted)">
+            <span>TOTAL</span><span>${Digao.money(total)}</span>
+          </div>
+          ${pago > 0 ? `
+            <div style="display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--success)">
+              <span>JÁ PAGO</span><strong>${Digao.money(pago)}</strong>
+            </div>
+          ` : ''}
+          <div style="display:flex;justify-content:space-between;font-size:16px;font-weight:800;padding:6px 0 0;color:var(--warning)">
+            <span>RESTANTE</span><span>${Digao.money(restante)}</span>
+          </div>
+        `;
+
+      const titulo = opts.title || `Fechar conta — Pedido #${Digao.pad(ordem.number || 0)}`;
+
+      return `
+        <h3 style="margin-bottom:14px">${escapeHtmlDigao(titulo)}</h3>
+
+        <div style="background:var(--bg-dark);border-radius:8px;padding:14px;margin-bottom:14px;max-height:180px;overflow-y:auto">
+          ${linhasItens}
+          <div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)">
+            ${totalLabel}
+          </div>
+        </div>
+
+        ${pagamentos.length > 0 ? `
+          <div style="background:var(--bg-dark);border-radius:8px;padding:12px;margin-bottom:14px">
+            <div style="font-size:11px;color:var(--text-muted);font-weight:700;letter-spacing:0.5px;margin-bottom:6px">PAGAMENTOS REGISTRADOS</div>
+            ${linhasPagamentos}
+          </div>
+        ` : ''}
+
+        ${restante <= 0 ? `
+          <div class="modal-actions">
+            <button class="btn btn-success btn-block" id="mpg-fechar-pago">
+              <i class="fa-solid fa-check"></i> Concluir
+            </button>
+          </div>
+        ` : `
+          <div class="label">Forma de pagamento</div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px" id="mpg-payment-methods">
+            <button class="pay-btn" data-method="DINHEIRO">Dinheiro</button>
+            <button class="pay-btn" data-method="PIX">Pix</button>
+            <button class="pay-btn" data-method="DEBITO">Débito</button>
+            <button class="pay-btn" data-method="CREDITO">Crédito</button>
+          </div>
+
+          <div style="margin-bottom:14px">
+            <label class="label">Valor deste pagamento (R$)</label>
+            <input class="input" type="number" id="mpg-valor" step="0.01" min="0" value="${saldoDevido.toFixed(2)}">
+          </div>
+
+          <div id="mpg-troco-wrap" style="margin-bottom:14px;display:none">
+            <label class="label">Valor recebido em DINHEIRO (R$)</label>
+            <input class="input" type="number" id="mpg-recebido" step="0.01" min="0" value="${saldoDevido.toFixed(2)}">
+            <div style="margin-top:6px;font-size:12px;color:var(--text-muted)">
+              Troco: <strong id="mpg-troco" style="color:var(--success)">R$ 0,00</strong>
+            </div>
+          </div>
+
+          <div id="mpg-erro" style="display:none;font-size:12px;color:var(--danger);margin-bottom:10px"></div>
+
+          <div class="modal-actions" style="flex-wrap:wrap;gap:8px">
+            <button class="btn btn-secondary" id="mpg-fechar-parcial">
+              <i class="fa-solid fa-clock"></i> Fechar / Pagar depois
+            </button>
+            <button class="btn btn-primary" id="mpg-confirm" disabled>
+              <i class="fa-solid fa-money-bill"></i> Registrar pagamento
+            </button>
+          </div>
+        `}
+      `;
+    };
+
+    const m = Digao.modal(renderConteudo(order));
+
+    let method = null;
+    let ordemAtual = order;
+
+    function bindConteudo() {
+      const overlay = m.overlay;
+
+      const btnConcluir = overlay.querySelector('#mpg-fechar-pago');
+      if (btnConcluir) {
+        btnConcluir.addEventListener('click', () => {
+          m.close();
+          if (typeof refreshCaixaStatus === 'function') refreshCaixaStatus();
+          if (typeof opts.onClose === 'function') opts.onClose({ quitado: true, ordem: ordemAtual });
+        });
+        return;
+      }
+
+      const btnFecharParcial = overlay.querySelector('#mpg-fechar-parcial');
+      const btnConfirm = overlay.querySelector('#mpg-confirm');
+      const valorInput = overlay.querySelector('#mpg-valor');
+      const trocoWrap = overlay.querySelector('#mpg-troco-wrap');
+      const recInput = overlay.querySelector('#mpg-recebido');
+      const trocoEl = overlay.querySelector('#mpg-troco');
+      const erroEl = overlay.querySelector('#mpg-erro');
+
+      const saldoDevido = Number(ordemAtual.remaining) || Number(ordemAtual.total);
+
+      function atualizarBotao() {
+        btnConfirm.disabled = !method;
+      }
+
+      function validarValor() {
+        erroEl.style.display = 'none';
+        const v = Number(valorInput.value);
+        if (!Number.isFinite(v) || v <= 0) {
+          erroEl.textContent = 'Valor inválido.';
+          erroEl.style.display = 'block';
+          btnConfirm.disabled = true;
+          return false;
+        }
+        if (v > saldoDevido + 0.01) {
+          erroEl.textContent = `Valor excede o saldo (R$ ${saldoDevido.toFixed(2)}).`;
+          erroEl.style.display = 'block';
+          btnConfirm.disabled = true;
+          return false;
+        }
+        atualizarBotao();
+        return true;
+      }
+
+      function atualizarTroco() {
+        if (method !== 'DINHEIRO') return;
+        const r = Number(recInput.value) || 0;
+        const valor = Number(valorInput.value) || 0;
+        const troco = r - valor;
+        trocoEl.textContent = Digao.money(Math.max(troco, 0));
+        trocoEl.style.color = troco >= 0 ? 'var(--success)' : 'var(--danger)';
+      }
+
+      valorInput.addEventListener('input', () => { validarValor(); atualizarTroco(); });
+      if (recInput) recInput.addEventListener('input', atualizarTroco);
+
+      overlay.querySelectorAll('#mpg-payment-methods .pay-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          overlay.querySelectorAll('#mpg-payment-methods .pay-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          method = btn.dataset.method;
+          if (trocoWrap) {
+            trocoWrap.style.display = method === 'DINHEIRO' ? 'block' : 'none';
+          }
+          atualizarTroco();
+          atualizarBotao();
+        });
+      });
+
+      validarValor();
+
+      btnFecharParcial.addEventListener('click', () => {
+        m.close();
+        if (typeof refreshCaixaStatus === 'function') refreshCaixaStatus();
+        if (typeof opts.onClose === 'function') opts.onClose({ quitado: false, ordem: ordemAtual });
+      });
+
+      btnConfirm.addEventListener('click', async () => {
+        if (!method) return;
+        if (!validarValor()) return;
+
+        const valor = Number(valorInput.value);
+        const received = method === 'DINHEIRO' ? Number(recInput.value) || valor : null;
+
+        btnConfirm.disabled = true;
+        btnConfirm.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Registrando…';
+
+        try {
+          await Digao.post(`/orders/${ordemAtual.id}/payment`, {
+            method,
+            amount: valor,
+            received
+          });
+
+          const atualizado = await Digao.get(`/orders/${ordemAtual.id}`);
+          ordemAtual = atualizado;
+
+          m.overlay.querySelector('.modal').innerHTML = renderConteudo(ordemAtual);
+          method = null;
+          bindConteudo();
+
+          if (Number(ordemAtual.remaining) <= 0) {
+            if (typeof refreshCaixaStatus === 'function') refreshCaixaStatus();
+            if (opts.autoCloseOnPaid) {
+              setTimeout(() => {
+                m.close();
+                if (typeof opts.onClose === 'function') opts.onClose({ quitado: true, ordem: ordemAtual });
+              }, 1500);
+            }
+          }
+        } catch (e) {
+          btnConfirm.disabled = false;
+          btnConfirm.innerHTML = '<i class="fa-solid fa-money-bill"></i> Registrar pagamento';
+          erroEl.textContent = e.message || 'Erro ao registrar pagamento.';
+          erroEl.style.display = 'block';
+        }
+      });
+    }
+
+    bindConteudo();
   },
 
   // ---------- ESTADO GLOBAL ----------

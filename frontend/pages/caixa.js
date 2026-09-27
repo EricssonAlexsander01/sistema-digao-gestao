@@ -1,8 +1,10 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Controle de Caixa
-   FIX Ciclo 6 / AUD-PG-07: botão "Estornar pedido" no card de
-     destaque + modal de estorno. Adicionado histórico de caixas
-     fechados com filtro from/to e paginação.
+   FIX Ciclo 9 / BUG 2: estorno espelha o método original.
+   FIX Ciclo 10 / GF-02 + GF-03: estorno parcial + por payment_id
+     com distribuição FIFO detalhada visível ao operador.
+   FIX Ciclo 10 / AUTZ: botão "Estornar pedido" visível apenas
+     para quem Digao.can('caixa.estornar').
    ============================================================ */
 
 let historicoPagina = 1;
@@ -68,7 +70,6 @@ function renderCaixaFechado(container) {
     carregarCaixa(container);
   });
 
-  // Renderiza o histórico também no estado fechado
   renderHistorico();
 }
 
@@ -102,7 +103,7 @@ function renderCaixaAberto(container, data) {
 
       <div class="card" style="padding:22px;background:linear-gradient(135deg,rgba(251,191,36,0.12),rgba(251,191,36,0.02));border:1px solid rgba(251,191,36,0.35);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
         <div>
-          <div style="font-size:12px;color:var(--primary);font-weight:700;letter-spacing:0.5px">SALDO ESPERADO EM CAIXA</div>
+          <div style="font-size:12px;color:var(--primary);font-weight:700;letter-spacing:0.5px">SALDO ESPERADO EM CAIXA (FÍSICO)</div>
           <div style="font-size:32px;font-weight:800;color:var(--primary);margin-top:6px;letter-spacing:-1px">${Digao.money(current)}</div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-top:6px">
             Aberto em ${Digao.date(opened_at)}
@@ -110,7 +111,9 @@ function renderCaixaAberto(container, data) {
           </div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <button class="btn btn-warning" id="btn-estornar"><i class="fa-solid fa-rotate-left"></i> Estornar pedido</button>
+          ${Digao.can('caixa.estornar') ? `
+            <button class="btn btn-warning" id="btn-estornar"><i class="fa-solid fa-rotate-left"></i> Estornar pedido</button>
+          ` : ''}
           <button class="btn btn-secondary" id="btn-add-mov"><i class="fa-solid fa-plus"></i> Movimentação</button>
           <button class="btn btn-danger" id="btn-fechar"><i class="fa-solid fa-lock"></i> Fechar caixa</button>
         </div>
@@ -135,9 +138,8 @@ function renderCaixaAberto(container, data) {
   document.getElementById('btn-add-mov').addEventListener('click', () => abrirModalMovimentacao(container));
   document.getElementById('btn-fechar').addEventListener('click', () => abrirModalFechamento(container, data));
   document.getElementById('btn-refresh-mov').addEventListener('click', () => carregarCaixa(container));
-  document.getElementById('btn-estornar').addEventListener('click', () => abrirModalEstorno(container));
+  document.getElementById('btn-estornar')?.addEventListener('click', () => abrirModalEstorno(container));
 
-  // Renderiza o histórico também no estado aberto
   renderHistorico();
 }
 
@@ -252,7 +254,7 @@ function abrirModalFechamento(container, data) {
       </div>
       ${refunds > 0 ? `
         <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px">
-          <span style="color:var(--text-muted)">Estornos</span>
+          <span style="color:var(--text-muted)">Estornos (dinheiro)</span>
           <strong style="color:var(--warning)">− ${Digao.money(refunds)}</strong>
         </div>
       ` : ''}
@@ -304,108 +306,208 @@ function abrirModalFechamento(container, data) {
 }
 
 // ============================================================
-// MODAL — ESTORNO (Ciclo 6 / AUD-PG-07)
+// MODAL — ESTORNO (Ciclo 10 / GF-02 + GF-03)
+// Permite estorno parcial, por payment_id específico, ou FIFO
+// com distribuição detalhada visível.
 // ============================================================
-function abrirModalEstorno(container) {
+async function abrirModalEstorno(container) {
   const html = `
     <h3 style="margin-bottom:6px">Estornar pedido</h3>
-    <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">
-      Informe o número do pedido e o valor a estornar. O estorno gera um movimento de caixa.
+    <p style="font-size:13px;color:var(--text-muted);margin-bottom:16px">
+      Informe o número do pedido para ver os pagamentos.
     </p>
 
-    <div style="display:flex;flex-direction:column;gap:14px">
+    <div style="display:flex;flex-direction:column;gap:12px">
       <div>
         <label class="label">Número do pedido</label>
         <input class="input" type="number" id="rf-order" placeholder="Ex: 5" min="1">
       </div>
-      <div>
+
+      <div id="rf-info" style="display:none"></div>
+
+      <div id="rf-pagamentos" style="display:none"></div>
+
+      <div id="rf-valor-wrap" style="display:none">
         <label class="label">Valor a estornar (R$)</label>
         <input class="input" type="number" id="rf-amount" step="0.01" min="0" value="0.00">
       </div>
-      <div>
+
+      <div id="rf-motivo-wrap" style="display:none">
         <label class="label">Motivo *</label>
-        <textarea class="input" id="rf-reason" rows="2" style="resize:none;font-family:inherit;font-size:13px" placeholder="Ex: Cliente desistiu / Erro de cobrança / Cancelamento"></textarea>
+        <textarea class="input" id="rf-reason" rows="2" style="resize:none;font-family:inherit;font-size:13px" placeholder="Ex: Cliente desistiu / Erro de cobrança"></textarea>
       </div>
-      <div id="rf-info" style="display:none;padding:10px 12px;background:var(--bg-dark);border-radius:6px;font-size:12px;color:var(--text-muted)"></div>
+
       <div id="rf-erro" style="display:none;font-size:12px;color:var(--danger)"></div>
     </div>
 
     <div class="modal-actions">
       <button class="btn btn-secondary" id="rf-cancel">Cancelar</button>
-      <button class="btn btn-warning" id="rf-confirm"><i class="fa-solid fa-rotate-left"></i> Estornar</button>
+      <button class="btn btn-warning" id="rf-confirm" disabled>
+        <i class="fa-solid fa-rotate-left"></i> Estornar
+      </button>
     </div>
   `;
 
   const m = Digao.modal(html);
 
   const orderInput = document.getElementById('rf-order');
-  const amountInput = document.getElementById('rf-amount');
-  const reasonInput = document.getElementById('rf-reason');
   const infoEl = document.getElementById('rf-info');
+  const pagamentosEl = document.getElementById('rf-pagamentos');
+  const valorWrap = document.getElementById('rf-valor-wrap');
+  const amountInput = document.getElementById('rf-amount');
+  const motivoWrap = document.getElementById('rf-motivo-wrap');
+  const reasonInput = document.getElementById('rf-reason');
   const errEl = document.getElementById('rf-erro');
+  const btnConfirm = document.getElementById('rf-confirm');
 
   let pedidoCarregado = null;
+  let paymentSelecionado = null; // null = FIFO
 
-  orderInput.addEventListener('blur', async () => {
-    const num = Number(orderInput.value);
-    if (!num || num <= 0) return;
-
+  // ============================================================
+  // Carrega o pedido e monta a UI de pagamentos
+  // ============================================================
+  async function carregarPedido(numero) {
     errEl.style.display = 'none';
     infoEl.style.display = 'none';
+    pagamentosEl.style.display = 'none';
+    valorWrap.style.display = 'none';
+    motivoWrap.style.display = 'none';
+    btnConfirm.disabled = true;
     pedidoCarregado = null;
+    paymentSelecionado = null;
 
-    try {
-      // Busca o pedido por número — usa a rota de listagem e filtra
-      const lista = await Digao.get('/orders?limit=200');
-      const found = lista.find(o => o.number === num);
+    const lista = await Digao.get('/orders?limit=200');
+    const found = lista.find(o => o.number === numero);
+    if (!found) {
+      errEl.textContent = `Pedido #${numero} não encontrado.`;
+      errEl.style.display = 'block';
+      return;
+    }
 
-      if (!found) {
-        errEl.textContent = `Pedido #${num} não encontrado.`;
-        errEl.style.display = 'block';
-        return;
-      }
+    const det = await Digao.get(`/orders/${found.id}`);
+    if (!det.payments || det.payments.length === 0) {
+      errEl.textContent = `Pedido #${numero} não possui pagamentos.`;
+      errEl.style.display = 'block';
+      return;
+    }
 
-      // Carrega detalhes atualizados
-      const det = await Digao.get(`/orders/${found.id}`);
+    const netPaid = Number(det.payments_total) || 0;
+    const refunded = Number(det.refunds_total) || 0;
 
-      if (!det.payments || det.payments.length === 0) {
-        errEl.textContent = `Pedido #${num} não possui pagamentos.`;
-        errEl.style.display = 'block';
-        return;
-      }
+    if (netPaid <= 0) {
+      errEl.textContent = `Pedido #${numero} já foi totalmente estornado.`;
+      errEl.style.display = 'block';
+      return;
+    }
 
-      const netPaid = det.payments_total || 0;
-      const refunded = det.refunds_total || 0;
+    pedidoCarregado = det;
 
-      if (netPaid <= 0) {
-        errEl.textContent = `Pedido #${num} já foi totalmente estornado.`;
-        errEl.style.display = 'block';
-        return;
-      }
-
-      pedidoCarregado = det;
-      infoEl.innerHTML = `
-        <div><strong>Pedido #${det.number}</strong> · total ${Digao.money(det.total)}</div>
+    // Info do pedido
+    infoEl.innerHTML = `
+      <div style="padding:10px 12px;background:var(--bg-dark);border-radius:6px;font-size:12px;color:var(--text-muted)">
+        <div><strong style="color:var(--text-main)">Pedido #${det.number}</strong> · total ${Digao.money(det.total)}</div>
         <div style="margin-top:4px">Pago (líquido): <strong style="color:var(--primary)">${Digao.money(netPaid)}</strong></div>
         ${refunded > 0 ? `<div style="margin-top:2px">Já estornado: ${Digao.money(refunded)}</div>` : ''}
-        <div style="margin-top:2px">Status: <strong>${det.financial_status}</strong></div>
-      `;
-      infoEl.style.display = 'block';
+      </div>
+    `;
+    infoEl.style.display = 'block';
 
-      amountInput.value = netPaid.toFixed(2);
-    } catch (e) {
-      errEl.textContent = 'Erro ao buscar pedido.';
-      errEl.style.display = 'block';
+    // Lista de pagamentos estornáveis
+    const payments = det.payments.filter(p => {
+      // Estornável = amount - refunds desse payment
+      const refs = (det.refunds || []).filter(r => r.payment_id === p.id);
+      const refSum = refs.reduce((s, r) => s + r.amount, 0);
+      return (p.amount - refSum) > 0.01;
+    });
+
+    pagamentosEl.innerHTML = `
+      <label class="label">Escolha o pagamento a estornar</label>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px">
+        <button class="rf-pick" data-payment-id="" style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-dark);border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-main);font-family:inherit;text-align:left;width:100%">
+          <span><strong>Ambos (FIFO)</strong> — distribuição automática</span>
+          <i class="fa-solid fa-check" style="display:none;color:var(--primary)"></i>
+        </button>
+        ${payments.map(p => {
+          const refs = (det.refunds || []).filter(r => r.payment_id === p.id);
+          const refSum = refs.reduce((s, r) => s + r.amount, 0);
+          const estornavel = p.amount - refSum;
+          return `
+            <button class="rf-pick" data-payment-id="${p.id}" style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-dark);border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-main);font-family:inherit;text-align:left;width:100%">
+              <span>${formatMethod(p.method)} — estornável <strong style="color:var(--primary)">${Digao.money(estornavel)}</strong></span>
+              <i class="fa-solid fa-check" style="display:none;color:var(--primary)"></i>
+            </button>
+          `;
+        }).join('')}
+      </div>
+    `;
+    pagamentosEl.style.display = 'block';
+
+    // Eventos de seleção
+    pagamentosEl.querySelectorAll('.rf-pick').forEach(btn => {
+      btn.addEventListener('click', () => {
+        pagamentosEl.querySelectorAll('.rf-pick').forEach(b => {
+          b.style.borderColor = 'var(--border)';
+          b.querySelector('i').style.display = 'none';
+        });
+        btn.style.borderColor = 'var(--primary)';
+        btn.querySelector('i').style.display = 'block';
+
+        const pid = btn.dataset.paymentId;
+        paymentSelecionado = pid === '' ? null : Number(pid);
+
+        // Define valor máximo estornável
+        let maxEstornavel;
+        if (paymentSelecionado === null) {
+          maxEstornavel = netPaid;
+        } else {
+          const p = payments.find(x => x.id === paymentSelecionado);
+          const refs = (det.refunds || []).filter(r => r.payment_id === p.id);
+          const refSum = refs.reduce((s, r) => s + r.amount, 0);
+          maxEstornavel = p.amount - refSum;
+        }
+
+        amountInput.value = maxEstornavel.toFixed(2);
+        amountInput.max = maxEstornavel.toFixed(2);
+        valorWrap.style.display = 'block';
+        motivoWrap.style.display = 'block';
+        btnConfirm.disabled = false;
+
+        validar();
+      });
+    });
+
+    // Validação de motivo + valor
+    function validar() {
+      const v = Number(amountInput.value);
+      const reason = reasonInput.value.trim();
+
+      if (!Number.isFinite(v) || v <= 0) {
+        btnConfirm.disabled = true;
+        return;
+      }
+      if (reason.length < 3) {
+        btnConfirm.disabled = true;
+        return;
+      }
+      btnConfirm.disabled = false;
     }
+
+    amountInput.addEventListener('input', validar);
+    reasonInput.addEventListener('input', validar);
+  }
+
+  orderInput.addEventListener('blur', () => {
+    const num = Number(orderInput.value);
+    if (num > 0) carregarPedido(num);
   });
 
   document.getElementById('rf-cancel').addEventListener('click', () => m.close());
 
-  document.getElementById('rf-confirm').addEventListener('click', async () => {
+  btnConfirm.addEventListener('click', async () => {
     errEl.style.display = 'none';
 
     if (!pedidoCarregado) {
-      errEl.textContent = 'Informe um número de pedido válido.';
+      errEl.textContent = 'Selecione um pagamento.';
       errEl.style.display = 'block';
       return;
     }
@@ -418,33 +520,43 @@ function abrirModalEstorno(container) {
       errEl.style.display = 'block';
       return;
     }
-    if (!amount || amount <= 0) {
-      errEl.textContent = 'Valor deve ser positivo.';
-      errEl.style.display = 'block';
-      return;
-    }
 
-    const btn = document.getElementById('rf-confirm');
-    btn.disabled = true;
-    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Estornando…';
+    btnConfirm.disabled = true;
+    btnConfirm.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Estornando…';
 
     try {
-      const res = await Digao.post(`/orders/${pedidoCarregado.id}/refund`, { amount, reason });
-      Digao.toast(`Estorno de ${Digao.money(res.refunded_amount)} registrado. Status: ${res.financial_status}`, 'success', 4000);
+      const payload = { amount, reason };
+      if (paymentSelecionado !== null) {
+        payload.payment_id = paymentSelecionado;
+      }
+
+      const res = await Digao.post(`/orders/${pedidoCarregado.id}/refund`, payload);
+
+      Digao.toast(
+        `Estorno de ${Digao.money(res.refunded_amount)} (${res.refunds_created} lançamento${res.refunds_created === 1 ? '' : 's'}). Status: ${res.financial_status}`,
+        'success',
+        4500
+      );
+
       m.close();
       refreshCaixaStatus();
       carregarCaixa(container);
+
     } catch (e) {
-      btn.disabled = false;
-      btn.innerHTML = '<i class="fa-solid fa-rotate-left"></i> Estornar';
+      btnConfirm.disabled = false;
+      btnConfirm.innerHTML = '<i class="fa-solid fa-rotate-left"></i> Estornar';
       errEl.textContent = e.message || 'Erro ao estornar.';
       errEl.style.display = 'block';
     }
   });
 }
 
+function formatMethod(m) {
+  return { DINHEIRO: '💵 Dinheiro', PIX: '⚡ Pix', DEBITO: '💳 Débito', CREDITO: '💳 Crédito' }[m] || m;
+}
+
 // ============================================================
-// HISTÓRICO DE CAIXAS — Ciclo 6
+// HISTÓRICO DE CAIXAS
 // ============================================================
 async function renderHistorico() {
   const wrapper = document.getElementById('historico-caixa-wrapper');
@@ -536,7 +648,6 @@ async function carregarHistorico() {
       </div>
     `).join('');
 
-    // Paginação
     pag.innerHTML = `
       <span>Página ${res.page} de ${res.total_pages} (${res.total} caixa${res.total === 1 ? '' : 's'})</span>
       <div style="display:flex;gap:6px">
@@ -552,7 +663,6 @@ async function carregarHistorico() {
       if (historicoPagina < res.total_pages) { historicoPagina++; carregarHistorico(); }
     });
 
-    // Clique no item → abre detalhes
     list.querySelectorAll('.hist-item').forEach(item => {
       item.addEventListener('click', () => abrirDetalhesCaixa(Number(item.dataset.id)));
       item.addEventListener('mouseenter', () => item.style.background = 'var(--bg-hover)');

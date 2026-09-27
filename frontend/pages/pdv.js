@@ -1,12 +1,15 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo PDV (com suporte a MESA)
-   FIX Bug #1: 1 mesa = 1 pedido ativo.
-   FIX Bug #8: listeners vivem em #pdv-root (recriado a cada render).
-   FIX Ciclo 1 Etapa 7: exibir saldo restante em modo MESA (parcial).
-   FIX Ciclo 3 / AUD-ME-07: separação itens existentes vs novos.
-   FIX Ciclo 9 / BUG 1: consolidação determinística (product_id + observation + is_additional).
-     - Botão "+" em item existente cria nova linha is_existing:false.
-     - Botão "-" em item existente é bloqueado (mensagem operacional).
+   FIX Ciclo 9 / BUG 1: consolidação determinística.
+   FIX Ciclo 10 / GF-01: pagamento dividido — modal permanece
+     aberto enquanto houver saldo, com botão [Fechar / Pagar depois],
+     nenhum método pré-selecionado e lista de pagamentos registrados.
+   FIX Ciclo 10 / AUTZ: esconde "Fechar conta" no banner para quem
+     não pode fechar; garçom cria pedido em balcão/WhatsApp sem
+     registrar pagamento (fica pendente para o Caixa).
+   FIX Ciclo 10.1 / IMPRESSÃO: print_status no pagamento não-MESA.
+   FIX Ciclo 10.1 / MODAL: Digao.abrirModalPagamento compartilhado.
+   FIX Ciclo 10.1 / BALCÃO: Confirmar pedido abre o modal de pagamento.
    ============================================================ */
 
 let produtosCache = [];
@@ -85,8 +88,6 @@ async function carregarContextoMesa(tableId) {
   }
 }
 
-// FIX Ciclo 3 / AUD-ME-07: itens do servidor marcados com is_existing: true.
-// FIX Ciclo 9 / BUG 1: adiciona is_additional para agrupamento coerente.
 function carregarItensDoPedidoAberto(order) {
   Digao.state.cart = order.items.map(it => ({
     product_id: it.product_id,
@@ -143,8 +144,7 @@ async function enviarParaCozinha() {
     if (res.ok && res.itensEnviados > 0) {
       Digao.toast(
         `${res.itensEnviados} ${res.itensEnviados === 1 ? 'item enviado' : 'itens enviados'} para a cozinha`,
-        'success',
-        2500
+        'success', 2500
       );
     } else if (res.ok && res.itensEnviados === 0) {
       Digao.toast('Nenhum item pendente', 'info', 1500);
@@ -186,13 +186,15 @@ function renderPDV() {
           <button class="btn btn-primary" id="btn-enviar-cozinha">
             <i class="fa-solid fa-fire"></i> Enviar para cozinha
           </button>
-          <button class="btn btn-success" id="btn-fechar-conta">
-            <i class="fa-solid fa-money-bill"></i>
-            Fechar conta (${Digao.money(mesaCtx.open_order.total)})
-            ${mesaCtx.open_order.financial_status === 'PARCIAL'
-              ? `<span style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;font-size:11px">PARCIAL · resta ${Digao.money(mesaCtx.open_order.remaining)}</span>`
-              : ''}
-          </button>
+          ${Digao.can('mesa.fecharConta') ? `
+            <button class="btn btn-success" id="btn-fechar-conta">
+              <i class="fa-solid fa-money-bill"></i>
+              Fechar conta (${Digao.money(mesaCtx.open_order.total)})
+              ${mesaCtx.open_order.financial_status === 'PARCIAL'
+                ? `<span style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:4px;margin-left:6px;font-size:11px">PARCIAL · resta ${Digao.money(mesaCtx.open_order.remaining)}</span>`
+                : ''}
+            </button>
+          ` : ''}
         ` : ''}
         <button class="btn btn-secondary" id="btn-voltar-mesas">
           <i class="fa-solid fa-arrow-left"></i> Voltar
@@ -292,7 +294,7 @@ function renderPDV() {
 
           <button class="confirm-btn" id="confirm-btn" disabled>
             <i class="fa-solid fa-print"></i>
-            <span>${mesaCtx ? 'Adicionar à comanda' : 'Confirmar & Gerar Comanda'}</span>
+            <span>${mesaCtx ? 'Adicionar à comanda' : 'Confirmar pedido'}</span>
           </button>
         </aside>
       </div>
@@ -427,8 +429,6 @@ function adicionarItem(produtoId) {
 
   const cart = Digao.state.cart;
 
-  // FIX Ciclo 9 / BUG 1: chave de equivalência coerente com o backend
-  // product_id + observation + is_additional (apenas itens novos da sessão)
   const novoExistente = cart.find(i =>
     i.is_existing === false &&
     i.product_id === prod.id &&
@@ -458,7 +458,6 @@ function alterarQtd(index, delta) {
   const item = cart[index];
   if (!item) return;
 
-  // FIX Ciclo 9 / BUG 1: +1 em item EXISTENTE vira nova linha (is_existing: false)
   if (delta === 1 && item.is_existing === true) {
     const novoExistente = cart.find(i =>
       i.is_existing === false &&
@@ -484,13 +483,11 @@ function alterarQtd(index, delta) {
     return;
   }
 
-  // FIX Ciclo 9 / BUG 1: -1 em item histórico é bloqueado
   if (delta === -1 && item.is_existing === true) {
     Digao.toast('Itens já lançados não podem ser reduzidos. Para corrigir, utilize o fluxo de cancelamento/ajuste.', 'warning', 4000);
     return;
   }
 
-  // Item novo da sessão → +/- normal
   item.quantity += delta;
   if (item.quantity <= 0) {
     cart.splice(index, 1);
@@ -671,26 +668,50 @@ async function confirmarVenda() {
       return;
     }
 
-    const recebido = Digao.state.paymentMethod === 'DINHEIRO'
-      ? Number(document.getElementById('valor-recebido').value) || order.total
-      : null;
+    // AUTZ: quem não pode registrar pagamento (ex.: garçom) cria o pedido
+    // e deixa o pagamento pendente para o Caixa.
+    if (!Digao.can('pdv.pagar')) {
+      Digao.toast(
+        `Pedido #${Digao.pad(order.number)} criado. Pagamento pendente — finalize no Caixa.`,
+        'info',
+        4500
+      );
 
-    const pagamento = await Digao.post(`/orders/${order.id}/payment`, {
-      method: Digao.state.paymentMethod,
-      amount: order.total,
-      received: recebido
+      Digao.state.cart = [];
+      const obsField = document.getElementById('order-observation');
+      if (obsField) obsField.value = '';
+      renderCarrinho();
+
+      return;
+    }
+
+    // Balcão / WhatsApp: abre o modal de pagamento compartilhado.
+    // Suporta pagamento único, dividido e parcial. Se ficar parcial,
+    // o pedido permanece em ABERTO/PARCIAL e pode ser retomado em Pedidos.
+    Digao.abrirModalPagamento(order, {
+      title: `Pedido #${Digao.pad(order.number)} — pagamento`,
+      onClose: ({ quitado, ordem }) => {
+        const quitou = quitado && ordem && Number(ordem.remaining) <= 0;
+
+        if (quitou) {
+          Digao.toast(`Pedido #${Digao.pad(order.number)} finalizado.`, 'success', 3000);
+        } else {
+          Digao.toast(
+            `Pedido #${Digao.pad(order.number)} salvo com saldo pendente. Finalize em Pedidos.`,
+            'info',
+            4500
+          );
+        }
+
+        Digao.state.cart = [];
+        const obsField = document.getElementById('order-observation');
+        if (obsField) obsField.value = '';
+        renderCarrinho();
+        refreshCaixaStatus();
+      }
     });
 
-    const comanda = await Digao.get(`/orders/${order.id}/comanda`);
-
-    mostrarComanda(order, comanda.text, pagamento);
-
-    refreshCaixaStatus();
-
-    Digao.state.cart = [];
-    const obsField = document.getElementById('order-observation');
-    if (obsField) obsField.value = '';
-    renderCarrinho();
+    return;
 
   } catch (e) {
     console.error(e);
@@ -699,119 +720,20 @@ async function confirmarVenda() {
       btn.disabled = false;
       btn.querySelector('span').textContent = isMesa
         ? 'Adicionar à comanda'
-        : 'Confirmar & Gerar Comanda';
+        : 'Confirmar pedido';
     }
   }
 }
 
-// ============================================================
-// MODAL — FECHAR CONTA DA MESA
-// ============================================================
 function abrirModalPagamentoMesa(order) {
-  const saldoDevido = order.remaining ?? order.total;
-
-  const html = `
-    <h3 style="margin-bottom:14px">Fechar conta — ${escapeHtml(mesaCtx.table_name)}</h3>
-
-    <div style="background:var(--bg-dark);border-radius:8px;padding:14px;margin-bottom:16px;max-height:240px;overflow-y:auto">
-      ${order.items.map(it => `
-        <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0">
-          <span><strong>${it.quantity}x</strong> ${escapeHtml(it.name)}</span>
-          <strong style="color:var(--primary)">${Digao.money(it.price * it.quantity)}</strong>
-        </div>
-      `).join('')}
-      <div style="display:flex;justify-content:space-between;font-size:17px;font-weight:800;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)">
-        <span>TOTAL</span>
-        <span style="color:var(--primary)">${Digao.money(order.total)}</span>
-      </div>
-
-      ${order.financial_status === 'PARCIAL' ? `
-        <div style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;margin-top:8px;color:var(--success)">
-          <span>Já pago</span>
-          <strong>${Digao.money(order.payments_total)}</strong>
-        </div>
-        <div style="display:flex;justify-content:space-between;font-size:15px;font-weight:800;padding-top:6px;color:var(--warning)">
-          <span>Saldo restante</span>
-          <span>${Digao.money(order.remaining)}</span>
-        </div>
-      ` : ''}
-    </div>
-
-    <div class="label">Forma de pagamento</div>
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px" id="mesa-payment-methods">
-      <button class="pay-btn active" data-method="DINHEIRO">Dinheiro</button>
-      <button class="pay-btn" data-method="PIX">Pix</button>
-      <button class="pay-btn" data-method="DEBITO">Débito</button>
-      <button class="pay-btn" data-method="CREDITO">Crédito</button>
-    </div>
-
-    <div id="mesa-troco-wrap" style="margin-bottom:16px">
-      <label class="label">Valor recebido (R$)</label>
-      <input class="input" type="number" id="mesa-recebido" step="0.01" min="0" value="${saldoDevido.toFixed(2)}">
-      <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">
-        Troco: <strong id="mesa-troco" style="color:var(--success)">R$ 0,00</strong>
-      </div>
-    </div>
-
-    <div class="modal-actions">
-      <button class="btn btn-secondary" id="mesa-pgto-cancel">Cancelar</button>
-      <button class="btn btn-primary" id="mesa-pgto-confirm">
-        <i class="fa-solid fa-check"></i> Confirmar pagamento
-      </button>
-    </div>
-  `;
-
-  const m = Digao.modal(html);
-  let method = 'DINHEIRO';
-
-  const recInput = document.getElementById('mesa-recebido');
-  const trocoEl = document.getElementById('mesa-troco');
-  const trocoWrap = document.getElementById('mesa-troco-wrap');
-
-  function updateTroco() {
-    const r = Number(recInput.value) || 0;
-    const t = r - saldoDevido;
-    trocoEl.textContent = Digao.money(Math.max(t, 0));
-    trocoEl.style.color = t >= 0 ? 'var(--success)' : 'var(--danger)';
-  }
-
-  function toggleTroco() {
-    trocoWrap.style.display = method === 'DINHEIRO' ? 'block' : 'none';
-    if (method === 'DINHEIRO') updateTroco();
-  }
-
-  recInput.addEventListener('input', updateTroco);
-  toggleTroco();
-
-  m.overlay.querySelectorAll('#mesa-payment-methods .pay-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      m.overlay.querySelectorAll('#mesa-payment-methods .pay-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      method = btn.dataset.method;
-      toggleTroco();
-    });
-  });
-
-  document.getElementById('mesa-pgto-cancel').addEventListener('click', () => m.close());
-
-  document.getElementById('mesa-pgto-confirm').addEventListener('click', async () => {
-    const recebido = method === 'DINHEIRO' ? Number(recInput.value) || saldoDevido : null;
-    try {
-      await Digao.post(`/orders/${order.id}/payment`, {
-        method,
-        amount: saldoDevido,
-        received: recebido
-      });
-
-      m.close();
-
-      Digao.toast(`${mesaCtx.table_name} paga com sucesso!`, 'success', 3000);
-      refreshCaixaStatus();
-
-      setTimeout(() => { location.hash = 'mesas'; }, 800);
-
-    } catch (e) {
-      console.error(e);
+  Digao.abrirModalPagamento(order, {
+    title: `Fechar conta — ${mesaCtx.table_name}`,
+    autoCloseOnPaid: true,
+    onClose: ({ quitado, ordem }) => {
+      if (quitado && ordem && Number(ordem.remaining) <= 0) {
+        Digao.toast(`${mesaCtx.table_name} totalmente paga!`, 'success', 3000);
+      }
+      setTimeout(() => { location.hash = 'mesas'; }, 300);
     }
   });
 }

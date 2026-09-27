@@ -4,6 +4,9 @@
    FIX Bug #3: listener de clique agora vive em #ws-root.
    FIX Ciclo 8 / DEC-02: campo de observação geral do pedido.
    FIX Ciclo 8 / DEC-03: campo de valor recebido (troco) para DINHEIRO.
+   FIX Ciclo 10 / AUTZ: garçom cria pedido WhatsApp sem registrar
+     pagamento (fica pendente para o Caixa).
+   FIX Ciclo 10.1 / MODAL: WhatsApp abre modal de pagamento compartilhado.
    ============================================================ */
 
 let wsProdutos = [];
@@ -434,41 +437,65 @@ async function confirmarWhatsApp() {
 
     const order = await Digao.post('/orders', payload);
 
-    // DEC-03: captura valor recebido se DINHEIRO
-    let received = null;
-    if (wsFormaPgto === 'DINHEIRO') {
-      const recebidoInput = document.getElementById('ws-valor-recebido');
-      received = Number(recebidoInput?.value) || null;
-      if (received && received < order.total) {
-        Digao.toast('Valor recebido insuficiente.', 'error');
-        btn.disabled = false;
-        btn.querySelector('span').textContent = 'Confirmar pedido';
-        return;
-      }
+    // AUTZ: quem não pode registrar pagamento (ex.: garçom) cria o pedido
+    // e deixa o pagamento pendente para o Caixa. Nada de /payment aqui.
+    if (!Digao.can('whatsapp.pagar')) {
+      Digao.toast(
+        `Pedido #${Digao.pad(order.number)} registrado. Pagamento pendente — finalize no Caixa.`,
+        'info',
+        4500
+      );
+
+      // Reset (mesmo padrão do fluxo normal)
+      wsCarrinho = [];
+      document.getElementById('ws-name').value = '';
+      document.getElementById('ws-phone').value = '';
+      document.getElementById('ws-address').value = '';
+      document.getElementById('ws-neighborhood').value = '';
+      document.getElementById('ws-complement').value = '';
+      document.getElementById('ws-fee').value = '8.00';
+      document.getElementById('ws-observation').value = '';
+      document.getElementById('ws-dados-label').textContent = 'Preencher dados de entrega';
+      renderWsCarrinho();
+
+      refreshCaixaStatus();
+
+      return;
     }
 
-    // Registra pagamento
-    await Digao.post(`/orders/${order.id}/payment`, {
-      method: wsFormaPgto,
-      amount: order.total,
-      received
+    // Balcão / WhatsApp: abre o modal de pagamento compartilhado.
+    // Suporta pagamento único, dividido e parcial. Se ficar parcial,
+    // o pedido permanece em ABERTO/PARCIAL e pode ser retomado em Pedidos.
+    Digao.abrirModalPagamento(order, {
+      title: `Pedido #${Digao.pad(order.number)} — pagamento`,
+      onClose: ({ quitado, ordem }) => {
+        const quitou = quitado && ordem && Number(ordem.remaining) <= 0;
+
+        if (quitou) {
+          Digao.toast(`Pedido #${Digao.pad(order.number)} finalizado.`, 'success', 3000);
+        } else {
+          Digao.toast(
+            `Pedido #${Digao.pad(order.number)} salvo com saldo pendente. Finalize em Pedidos.`,
+            'info',
+            4500
+          );
+        }
+
+        wsCarrinho = [];
+        document.getElementById('ws-name').value = '';
+        document.getElementById('ws-phone').value = '';
+        document.getElementById('ws-address').value = '';
+        document.getElementById('ws-neighborhood').value = '';
+        document.getElementById('ws-complement').value = '';
+        document.getElementById('ws-fee').value = '8.00';
+        document.getElementById('ws-observation').value = '';
+        document.getElementById('ws-dados-label').textContent = 'Preencher dados de entrega';
+        renderWsCarrinho();
+        refreshCaixaStatus();
+      }
     });
 
-    Digao.toast(`Pedido #${Digao.pad(order.number)} registrado!`, 'success');
-
-    // Reset
-    wsCarrinho = [];
-    document.getElementById('ws-name').value = '';
-    document.getElementById('ws-phone').value = '';
-    document.getElementById('ws-address').value = '';
-    document.getElementById('ws-neighborhood').value = '';
-    document.getElementById('ws-complement').value = '';
-    document.getElementById('ws-fee').value = '8.00';
-    document.getElementById('ws-observation').value = '';
-    document.getElementById('ws-dados-label').textContent = 'Preencher dados de entrega';
-    renderWsCarrinho();
-
-    refreshCaixaStatus();
+    return;
 
   } catch (e) {
     console.error(e);

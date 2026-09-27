@@ -6,6 +6,8 @@
      afetando somente tables.waiter_id.
    FIX Ciclo 5 / AUD-ARQ-01: modal de gerenciar mesa marca
      adicionais com prefixo '+' e destaque visual.
+   FIX Ciclo 10 / AUTZ: esconde "Fechar conta", "Trocar garçom"
+     e "Forçar liberação" conforme Digao.can(...).
    ============================================================ */
 
 let mesasCache = [];
@@ -100,7 +102,16 @@ function renderMesaCard(m) {
   let itensTxt = '';
 
   if (isOcupada && m.open_order) {
-    totalTxt = Digao.money(m.open_order.total);
+    const fs = m.open_order.financial_status;
+    const total = Number(m.open_order.total) || 0;
+    const remaining = Number(m.open_order.remaining) || 0;
+
+    if (fs === 'PARCIAL') {
+      totalTxt = `${Digao.money(remaining)} <span style="display:block;font-size:11px;font-weight:500;color:var(--text-muted);margin-top:2px">resta · total ${Digao.money(total)}</span>`;
+    } else {
+      totalTxt = Digao.money(total);
+    }
+
     itensTxt = `${m.open_order.items.length} ${m.open_order.items.length === 1 ? 'item' : 'itens'}`;
     waiterTxt = m.waiter_name || '—';
   }
@@ -215,6 +226,7 @@ function abrirModalAbrirMesa(mesa) {
 // ============================================================
 // MODAL — GERENCIAR MESA OCUPADA
 // FIX Ciclo 5 / AUD-ARQ-01: marca adicionais com prefixo '+'
+// FIX Ciclo 10 / AUTZ: esconde botões conforme Digao.can(...)
 // ============================================================
 function abrirModalGerenciarMesa(mesa) {
   const order = mesa.open_order;
@@ -251,23 +263,29 @@ function abrirModalGerenciarMesa(mesa) {
         <button class="btn btn-primary btn-block" id="mesa-adicionar">
           <i class="fa-solid fa-plus"></i> Adicionar mais itens
         </button>
-        <button class="btn btn-success btn-block" id="mesa-pagar">
-          <i class="fa-solid fa-money-bill"></i> Fechar conta (${Digao.money(order.total)})
-        </button>
+        ${Digao.can('mesa.fecharConta') ? `
+          <button class="btn btn-success btn-block" id="mesa-pagar">
+            <i class="fa-solid fa-money-bill"></i> Fechar conta (${Digao.money(order.total)})
+          </button>
+        ` : ''}
       ` : `
         <button class="btn btn-primary btn-block" id="mesa-iniciar">
           <i class="fa-solid fa-plus"></i> Iniciar pedido
         </button>
       `}
-      <button class="btn btn-secondary btn-block" id="mesa-trocar-garcom">
-        <i class="fa-solid fa-user-pen"></i> Trocar garçom
-      </button>
+      ${Digao.can('mesa.trocarGarcom') ? `
+        <button class="btn btn-secondary btn-block" id="mesa-trocar-garcom">
+          <i class="fa-solid fa-user-pen"></i> Trocar garçom
+        </button>
+      ` : ''}
       <button class="btn btn-secondary btn-block" id="mesa-cancelar">
         Cancelar
       </button>
-      <button class="btn btn-danger btn-block" id="mesa-force-free" style="font-size:11.5px;padding:8px">
-        <i class="fa-solid fa-triangle-exclamation"></i> Forçar liberação da mesa
-      </button>
+      ${Digao.can('mesa.forceFree') ? `
+        <button class="btn btn-danger btn-block" id="mesa-force-free" style="font-size:11.5px;padding:8px">
+          <i class="fa-solid fa-triangle-exclamation"></i> Forçar liberação da mesa
+        </button>
+      ` : ''}
     </div>
   `;
 
@@ -291,12 +309,12 @@ function abrirModalGerenciarMesa(mesa) {
     location.hash = `pdv?table=${mesa.id}&pay=${order.id}`;
   });
 
-  document.getElementById('mesa-trocar-garcom').addEventListener('click', () => {
+  document.getElementById('mesa-trocar-garcom')?.addEventListener('click', () => {
     m.close();
     abrirModalTrocarGarcom(mesa);
   });
 
-  document.getElementById('mesa-force-free').addEventListener('click', () => {
+  document.getElementById('mesa-force-free')?.addEventListener('click', () => {
     m.close();
     abrirModalForceFree(mesa);
   });

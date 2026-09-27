@@ -1,6 +1,8 @@
 /* ============================================================
    DIGÃO GESTÃO — Módulo Entregadores (com filtros + total)
    FIX Bug #4c: timezone em todas as conversões de data
+   FIX Ciclo 10 / AUTZ: cadastro/edição/ativação só admin;
+     pagamento admin/caixa; tudo via Digao.can(...).
    ============================================================ */
 
 let driversCache = [];
@@ -79,9 +81,11 @@ function renderEntregadoresLayout() {
             Controle de entregas e valores devidos por entregador.
           </p>
         </div>
-        <button class="btn btn-primary" id="btn-novo-entregador">
-          <i class="fa-solid fa-plus"></i> Novo entregador
-        </button>
+        ${Digao.can('entregador.cadastrar') ? `
+          <button class="btn btn-primary" id="btn-novo-entregador">
+            <i class="fa-solid fa-plus"></i> Novo entregador
+          </button>
+        ` : ''}
       </div>
 
       <div id="drivers-grid" class="grid-2"></div>
@@ -192,11 +196,16 @@ function renderDriversGrid() {
           <span style="color:var(--text-muted)">Valor devido</span>
           <strong style="color:var(--primary);font-size:14px">${Digao.money(summary.pending.total)}</strong>
         </div>
-        ${summary.pending.total > 0 ? `
-          <button class="btn btn-success btn-block" style="margin-top:12px" data-action="pay" data-driver="${d.id}">
-            <i class="fa-solid fa-money-bill-transfer"></i> Pagar ${Digao.money(summary.pending.total)}
-          </button>
-        ` : '<div style="font-size:11.5px;color:var(--success);text-align:center;margin-top:10px">✓ Sem pendências</div>'}
+        ${summary.pending.total > 0
+          ? (Digao.can('entregador.pagar')
+              ? `<button class="btn btn-success btn-block" style="margin-top:12px" data-action="pay" data-driver="${d.id}">
+                   <i class="fa-solid fa-money-bill-transfer"></i> Pagar ${Digao.money(summary.pending.total)}
+                 </button>`
+              : `<div style="font-size:11.5px;color:var(--warning);text-align:center;margin-top:10px">
+                   Há pendências — solicite pagamento ao administrador.
+                 </div>`)
+          : '<div style="font-size:11.5px;color:var(--success);text-align:center;margin-top:10px">✓ Sem pendências</div>'
+        }
       `;
 
       el.querySelector('[data-action="pay"]')?.addEventListener('click', () => pagarEntregador(d.id, summary.pending.total));
@@ -227,14 +236,20 @@ function renderDriverCard(d) {
         <div style="font-size:12px;color:var(--text-muted)">Carregando…</div>
       </div>
 
-      <div style="display:flex;gap:8px;margin-top:12px">
-        <button class="btn btn-secondary" style="flex:1" data-action="edit" data-driver="${d.id}">
-          <i class="fa-solid fa-pen"></i> Editar
-        </button>
-        <button class="btn btn-secondary" data-action="toggle" data-driver="${d.id}">
-          <i class="fa-solid ${d.active ? 'fa-eye-slash' : 'fa-eye'}"></i>
-        </button>
-      </div>
+      ${Digao.can('entregador.editar') || Digao.can('entregador.ativar') ? `
+        <div style="display:flex;gap:8px;margin-top:12px">
+          ${Digao.can('entregador.editar') ? `
+            <button class="btn btn-secondary" style="flex:1" data-action="edit" data-driver="${d.id}">
+              <i class="fa-solid fa-pen"></i> Editar
+            </button>
+          ` : ''}
+          ${Digao.can('entregador.ativar') ? `
+            <button class="btn btn-secondary" data-action="toggle" data-driver="${d.id}">
+              <i class="fa-solid ${d.active ? 'fa-eye-slash' : 'fa-eye'}"></i>
+            </button>
+          ` : ''}
+        </div>
+      ` : ''}
     </div>
   `;
 }
@@ -372,7 +387,7 @@ function abrirModalEntregador(driver = null) {
 // EVENTOS
 // ============================================================
 function bindEntregadoresEvents() {
-  document.getElementById('btn-novo-entregador').addEventListener('click', () => abrirModalEntregador());
+  document.getElementById('btn-novo-entregador')?.addEventListener('click', () => abrirModalEntregador());
 
   document.getElementById('filtro-periodo').addEventListener('change', (e) => {
     delivFiltro.periodo = e.target.value;

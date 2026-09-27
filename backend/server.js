@@ -23,6 +23,8 @@
 // + FIX Ciclo 9 / BUG 2: estorno espelha o método original do pagamento.
 //   DINHEIRO → cria cash_movement 'ESTORNO'
 //   PIX/DEBITO/CREDITO → apenas payments_refunds (não é físico)
+// + FIX Ciclo 10 / AUTZ: matriz de permissões por role/status
+// + FIX Ciclo 10.1 / IMPRESSÃO: print_status no pagamento não-MESA
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -516,7 +518,7 @@ app.post('/api/tables/:id/open', auth.requireRole('admin','caixa','garcom'), (re
   res.json({ ok: true });
 });
 
-app.post('/api/tables/:id/close', auth.requireRole('admin','caixa','garcom'), (req, res) => {
+app.post('/api/tables/:id/close', auth.requireRole('admin','caixa'), (req, res) => {
   const t = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
   if (!t) return res.status(404).json({ error: 'Mesa não encontrada' });
 
@@ -884,6 +886,20 @@ app.put('/api/orders/:id', auth.requireRole('admin','caixa','garcom','cozinha'),
   const valid = ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'Status inválido' });
 
+  // Ciclo 10 — autorização por role e transição (matriz V1)
+  const STATUSES_POR_ROLE = {
+    admin:   ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'],
+    caixa:   ['NOVO','EM PREPARO','PRONTO','EM ROTA','CONCLUIDO','CANCELADO'],
+    cozinha: ['EM PREPARO','PRONTO'],
+    garcom:  []
+  };
+  const permitidos = STATUSES_POR_ROLE[req.user.role] || [];
+  if (!permitidos.includes(status)) {
+    return res.status(403).json({
+      error: `Acesso negado: role "${req.user.role}" não pode alterar pedido para "${status}".`
+    });
+  }
+
   const pedido = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
   if (!pedido) return res.status(404).json({ error: 'Pedido não encontrado' });
 
@@ -1086,9 +1102,22 @@ app.post('/api/orders/:id/payment', auth.requireRole('admin','caixa'), (req, res
         .catch(e => console.error('[payment] erro ao imprimir fallback:', e));
     }
   } else {
-    const itemsPgto = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
-    printer.imprimirComanda(order, itemsPgto, mesaPgto, garcomPgto)
-      .catch(e => console.error('[payment] erro ao imprimir:', e));
+    // Ciclo 10.1 / Impressão: só imprime itens pendentes e marca após sucesso.
+    // Espelha o comportamento do ramo MESA.
+    const pendentes = getPendingItems(order.id);
+    if (pendentes.length > 0) {
+      printer.imprimirComanda(order, pendentes, mesaPgto, garcomPgto)
+        .then(result => {
+          if (result.ok) {
+            const ids = pendentes.map(i => i.id);
+            const ph = ids.map(() => '?').join(',');
+            db.prepare(`
+              UPDATE order_items SET print_status = 1 WHERE id IN (${ph})
+            `).run(...ids);
+          }
+        })
+        .catch(e => console.error('[payment] erro ao imprimir:', e));
+    }
   }
 
   res.json({
@@ -1422,7 +1451,6 @@ app.post('/api/print/comanda/:id', auth.requireAuth, async (req, res) => {
   if (result.ok) res.json({ ok: true });
   else res.status(500).json({ error: result.error });
 });
-
 
 // ============================================================
 // CASH REGISTER
